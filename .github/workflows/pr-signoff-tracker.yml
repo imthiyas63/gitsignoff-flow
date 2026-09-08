@@ -62,32 +62,36 @@ jobs:
             }
             const relatedIssues = Array.from(issueNumbers);
 
-            // 3. Count currently checked boxes
+            // 3. Count currently checked boxes and track who signed
             let checkedCount = 0;
             const signoffData = {};
-            const timestamp = new Date().toISOString();
-
             for (const role of roles) {
               const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
               if (regex.test(body)) {
                 checkedCount++;
-                signoffData[role] = { signed: true, by: sender, at: timestamp };
+                signoffData[role] = {
+                  signed: true,
+                  by: sender,
+                  at: new Date().toISOString()
+                };
               } else {
                 signoffData[role] = { signed: false, by: null, at: null };
               }
             }
 
-            // 4. Post comment on PR for audit trail
+            // 4. Post comment on PR (for PR audit trail)
             const { data: prComments } = await github.rest.issues.listComments({
               owner, repo, issue_number: prNumber, per_page: 100
             });
 
+            const timestamp = new Date().toISOString();
             for (const role of roles) {
               if (signoffData[role].signed) {
                 const alreadyRecorded = prComments.some(c => 
                   c.body.includes(`Sign-off Recorded: ${role}`) && 
                   !c.body.includes(`Revoked`)
                 );
+                
                 if (!alreadyRecorded) {
                   await github.rest.issues.createComment({
                     owner, repo, issue_number: prNumber,
@@ -97,40 +101,47 @@ jobs:
               }
             }
 
-            // 5. UPDATE ISSUE DESCRIPTION WITH TABLE
+            // 5. UPDATE ISSUE DESCRIPTION (Text Field)
             for (const issueNum of relatedIssues) {
               try {
+                // Get current issue
                 const { data: issue } = await github.rest.issues.get({
                   owner, repo, issue_number: issueNum
                 });
 
-                // Build the table safely without complex inline JS
-                let tableRows = "";
-                for (const role of roles) {
-                  const data = signoffData[role];
+                // Build the markdown table safely
+                const tableRows = Object.entries(signoffData).map(([role, data]) => {
                   const status = data.signed ? '✅ Approved' : '⏳ Pending';
                   const signedBy = data.signed ? `@${data.by}` : '-';
                   const time = data.signed ? data.at : '-';
-                  tableRows += `| **${role}** | ${status} | ${signedBy} | ${time} |\n`;
-                }
+                  return `| **${role}** | ${status} | ${signedBy} | ${time} |`;
+                }).join('\n');
 
-                const signoffTable = `## PR Sign-off Status\n\n| Role | Status | Signed By | Timestamp |\n|------|--------|-----------|-----------|\n${tableRows}\n---\n*Last updated: ${timestamp} from PR #${prNumber}*`;
+                const signoffTable = [
+                  '## PR Sign-off Status',
+                  '',
+                  '| Role | Status | Signed By | Timestamp |',
+                  '|------|--------|-----------|-----------|',
+                  tableRows,
+                  '',
+                  '---',
+                  `*Last updated: ${new Date().toISOString()} from PR #${prNumber}*`
+                ].join('\n');
 
-                // Replace existing table or append new one
-                let newBody = issue.body || "";
-                const tableRegex = /## PR Sign-off Status[\s\S]*?(?=##|\Z)/;
-                
-                if (tableRegex.test(newBody)) {
-                  newBody = newBody.replace(tableRegex, signoffTable);
+                // Update issue body - replace existing table or append
+                let newBody = issue.body || '';
+                if (newBody.includes('## PR Sign-off Status')) {
+                  newBody = newBody.replace(/## PR Sign-off Status[\s\S]*?(?=##|$)/, signoffTable);
                 } else {
-                  newBody = newBody + "\n\n" + signoffTable;
+                  newBody = newBody + '\n\n' + signoffTable;
                 }
 
                 await github.rest.issues.update({
                   owner, repo, issue_number: issueNum,
                   body: newBody
                 });
-                core.info(`Updated Issue #${issueNum} description`);
+
+                core.info(`Updated Issue #${issueNum} description with sign-off table`);
               } catch (error) {
                 core.warning(`Could not update Issue #${issueNum}: ${error.message}`);
               }
