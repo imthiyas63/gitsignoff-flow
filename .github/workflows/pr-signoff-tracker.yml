@@ -1,19 +1,20 @@
-name: PR Sign-off Gatekeeper
+name: pr-signoff-gatekeeper
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
 
 permissions:
-  pull-requests: write  # Needed to update PR body and post comments
+  pull-requests: write
   contents: read
-  statuses: write       # Needed to block the merge button
+  statuses: write
 
 jobs:
-  signoff-gate:
+  validate-signoff:
+    name: Validate Sign-off Checkboxes
     runs-on: ubuntu-latest
     steps:
-      - name: Validate Checkboxes and Block Self-Approval
+      - name: check-signoff-status
         uses: actions/github-script@v7
         with:
           script: |
@@ -22,45 +23,35 @@ jobs:
             const sha = pr.head.sha;
             const body = pr.body || "";
             
-            // Identify the PR Author and the person who just edited the PR
             const author = pr.user.login;
             const sender = context.payload.sender.login;
-
             const roles = ['Code Review', 'QA Signoff', 'Impact Analysis Review'];
 
-            // 1. SELF-APPROVAL BLOCKER
+            // 1. Self-Approval Blocker (Non-intrusive: fails and comments, does not mutate PR body)
             if (author === sender) {
-              core.warning(`⚠️ PR Author @${author} is trying to sign off on their own PR.`);
+              const warningMessage = `### ⚠️ Self-Approval Blocked\n**@${sender}**, you cannot sign off on your own Pull Request.\n\nPlease ask another team member to review and check the boxes.`;
               
-              // Revert any checked boxes back to unchecked to prevent fake approvals
-              let newBody = body;
-              roles.forEach(role => {
-                const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'gi');
-                newBody = newBody.replace(regex, `- [ ] ${role}`);
-              });
-
-              // Update the PR description to uncheck the boxes
-              await github.rest.pulls.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber,
-                body: newBody
-              });
-
-              // Post a warning comment
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: prNumber,
-                body: `### ⚠️ Self-Approval Blocked\n**@${sender}**, you cannot sign off on your own Pull Request.\n\nThe checkboxes have been automatically unchecked. Please ask another team member to review and check the boxes.`
+                body: warningMessage
               });
 
-              // Fail the workflow to block the merge
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: sha,
+                state: 'failure',
+                context: 'pr-signoff-gatekeeper',
+                description: 'Self-approval is not allowed'
+              });
+
               core.setFailed(`PR Author (@${author}) is not allowed to approve their own PR.`);
-              return; // Stop the script here
+              return;
             }
 
-            // 2. VALIDATE CHECKBOXES (Only runs if a non-author edited the PR)
+            // 2. Validate Checkboxes
             let checkedCount = 0;
             for (const role of roles) {
               const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
@@ -69,7 +60,7 @@ jobs:
               }
             }
 
-            // 3. POST AUDIT COMMENTS (To keep the record of who approved)
+            // 3. Post Audit Comments (Idempotent check to prevent spam)
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -93,19 +84,19 @@ jobs:
               }
             }
 
-            // 4. SET MERGE GATE STATUS
+            // 4. Set Merge Gate Status
             const allSignedOff = checkedCount === roles.length;
             const state = allSignedOff ? 'success' : 'failure';
             const description = allSignedOff 
-              ? `All ${roles.length} sign-offs complete ✅` 
-              : `${checkedCount}/${roles.length} sign-offs complete. Waiting...`;
+              ? `All ${roles.length} sign-offs complete` 
+              : `${checkedCount}/${roles.length} sign-offs complete`;
 
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
               sha: sha,
               state: state,
-              context: 'PR Sign-off Gatekeeper',
+              context: 'pr-signoff-gatekeeper',
               description: description
             });
 
