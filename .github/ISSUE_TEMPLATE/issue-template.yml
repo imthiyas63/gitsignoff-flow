@@ -1,0 +1,49 @@
+name: Feature / Bug Fix
+description: Track development, QA, and review sign-offs
+title: "[Bug/Feature]: "
+labels: []
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: "## Sign-off Tracking"
+
+  - type: dropdown
+    id: code-review
+    attributes:
+      label: "Code Review Status"
+      description: "Status of the code review"
+      options:
+        - "Not Started"
+        - "In Progress"
+        - "Approved"
+        - "Needs Changes"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: dev-review
+    attributes:
+      label: "Dev Review Status"
+      description: "Status of the development review"
+      options:
+        - "Not Started"
+        - "In Progress"
+        - "Approved"
+        - "Needs Changes"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: qa-status
+    attributes:
+      label: "QA Status"
+      description: "Status of QA testing and sign-off"
+      options:
+        - "Not Started"
+        - "Testing"
+        - "Approved"
+        - "Failed"
+    validations:
+      required: true
