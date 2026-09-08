@@ -5,15 +5,15 @@ on:
     types: [opened, synchronize, reopened, edited]
 
 permissions:
-  pull-requests: write
+  pull-requests: write  # Needed to update PR body and post comments
   contents: read
-  statuses: write  # ⚠️ CRITICAL: This allows the workflow to block the merge button
+  statuses: write       # Needed to block the merge button
 
 jobs:
   signoff-gate:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate Checkboxes and Block Merge
+      - name: Validate Checkboxes and Block Self-Approval
         uses: actions/github-script@v7
         with:
           script: |
@@ -21,11 +21,47 @@ jobs:
             const prNumber = pr.number;
             const sha = pr.head.sha;
             const body = pr.body || "";
+            
+            // Identify the PR Author and the person who just edited the PR
+            const author = pr.user.login;
+            const sender = context.payload.sender.login;
 
             const roles = ['Code Review', 'QA Signoff', 'Impact Analysis Review'];
-            let checkedCount = 0;
 
-            // 1. Count how many boxes are checked
+            // 1. SELF-APPROVAL BLOCKER
+            if (author === sender) {
+              core.warning(`⚠️ PR Author @${author} is trying to sign off on their own PR.`);
+              
+              // Revert any checked boxes back to unchecked to prevent fake approvals
+              let newBody = body;
+              roles.forEach(role => {
+                const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'gi');
+                newBody = newBody.replace(regex, `- [ ] ${role}`);
+              });
+
+              // Update the PR description to uncheck the boxes
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                body: newBody
+              });
+
+              // Post a warning comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `### ⚠️ Self-Approval Blocked\n**@${sender}**, you cannot sign off on your own Pull Request.\n\nThe checkboxes have been automatically unchecked. Please ask another team member to review and check the boxes.`
+              });
+
+              // Fail the workflow to block the merge
+              core.setFailed(`PR Author (@${author}) is not allowed to approve their own PR.`);
+              return; // Stop the script here
+            }
+
+            // 2. VALIDATE CHECKBOXES (Only runs if a non-author edited the PR)
+            let checkedCount = 0;
             for (const role of roles) {
               const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
               if (regex.test(body)) {
@@ -33,7 +69,7 @@ jobs:
               }
             }
 
-            // 2. Post comments (to keep the audit trail)
+            // 3. POST AUDIT COMMENTS (To keep the record of who approved)
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -51,13 +87,13 @@ jobs:
                     owner: context.repo.owner,
                     repo: context.repo.repo,
                     issue_number: prNumber,
-                    body: `### ✅ Sign-off Recorded\n**Role:** ${role}\n**Signed by:** @${context.payload.sender.login}\n**Timestamp:** ${timestamp}`
+                    body: `### ✅ Sign-off Recorded\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}`
                   });
                 }
               }
             }
 
-            // 3. THE MAGIC: Set the Commit Status to block the merge
+            // 4. SET MERGE GATE STATUS
             const allSignedOff = checkedCount === roles.length;
             const state = allSignedOff ? 'success' : 'failure';
             const description = allSignedOff 
@@ -69,7 +105,7 @@ jobs:
               repo: context.repo.repo,
               sha: sha,
               state: state,
-              context: 'PR Sign-off Gatekeeper', // This is the name we will use in Branch Protection
+              context: 'PR Sign-off Gatekeeper',
               description: description
             });
 
