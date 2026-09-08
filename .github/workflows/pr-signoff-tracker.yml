@@ -1,0 +1,59 @@
+name: PR Sign-off Tracker
+
+on:
+  pull_request:
+    types: [edited]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  track-signoffs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record Sign-off Username and Timestamp
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const sender = context.payload.sender.login;
+            const prNumber = pr.number;
+            const body = pr.body || "";
+
+            // The exact roles from your template
+            const roles = ['Code Review', 'QA Signoff', 'Impact Analysis Review'];
+
+            // Find which roles are currently checked
+            const checkedRoles = roles.filter(role => {
+              const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
+              return regex.test(body);
+            });
+
+            if (checkedRoles.length === 0) return;
+
+            // Get existing comments to prevent duplicate spam
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100
+            });
+
+            for (const role of checkedRoles) {
+              // Check if we already posted a comment for this specific role
+              const alreadyPosted = comments.some(c => c.body.includes(`Sign-off Recorded: ${role}`));
+
+              if (!alreadyPosted) {
+                const timestamp = new Date().toISOString();
+                const commentBody = `### ✅ Sign-off Recorded\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}`;
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: commentBody
+                });
+                core.info(`✅ Posted audit comment for ${role}`);
+              }
+            }
