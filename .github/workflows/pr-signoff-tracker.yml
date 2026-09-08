@@ -8,6 +8,7 @@ permissions:
   pull-requests: write
   contents: read
   statuses: write
+  issues: write  # ⚠️ CRITICAL: Allows posting comments to Issues
 
 jobs:
   validate-signoff:
@@ -22,26 +23,25 @@ jobs:
             const prNumber = pr.number;
             const sha = pr.head.sha;
             const body = pr.body || "";
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
             
             const author = pr.user.login;
             const sender = context.payload.sender.login;
             const roles = ['Code Review', 'QA Signoff', 'Impact Analysis Review'];
 
-            // 1. Self-Approval Blocker (Non-intrusive: fails and comments, does not mutate PR body)
+            // 1. Self-Approval Blocker
             if (author === sender) {
               const warningMessage = `### ⚠️ Self-Approval Blocked\n**@${sender}**, you cannot sign off on your own Pull Request.\n\nPlease ask another team member to review and check the boxes.`;
               
               await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner, repo,
                 issue_number: prNumber,
                 body: warningMessage
               });
 
               await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: sha,
+                owner, repo, sha,
                 state: 'failure',
                 context: 'pr-signoff-gatekeeper',
                 description: 'Self-approval is not allowed'
@@ -51,8 +51,33 @@ jobs:
               return;
             }
 
-            // 2. Validate Checkboxes
+            // 2. Extract Issue Numbers from PR body
+            // Matches: "Closes #1", "Fixes #123", "Resolves #456", or just "#1"
+            const issueNumbers = new Set();
+            
+            // Pattern 1: Closes/Fixes/Resolves #123
+            const keywordRegex = /(?:Closes|Fixes|Resolves)\s+#(\d+)/gi;
+            let match;
+            while ((match = keywordRegex.exec(body)) !== null) {
+              issueNumbers.add(parseInt(match[1]));
+            }
+            
+            // Pattern 2: Any #number reference (e.g., "#1 testing")
+            const hashRegex = /#(\d+)/g;
+            while ((match = hashRegex.exec(body)) !== null) {
+              const num = parseInt(match[1]);
+              // Don't add the PR number itself
+              if (num !== prNumber) {
+                issueNumbers.add(num);
+              }
+            }
+
+            const relatedIssues = Array.from(issueNumbers);
+            core.info(`🔗 Found related issues: #${relatedIssues.join(', #')}`);
+
+            // 3. Validate Checkboxes
             let checkedCount = 0;
+            
             for (const role of roles) {
               const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
               if (regex.test(body)) {
@@ -60,10 +85,9 @@ jobs:
               }
             }
 
-            // 3. Post Audit Comments (Idempotent check to prevent spam)
+            // 4. Post Audit Comments on PR AND Related Issues
             const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner, repo,
               issue_number: prNumber,
               per_page: 100
             });
@@ -72,19 +96,38 @@ jobs:
               const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
               if (regex.test(body)) {
                 const alreadyPosted = comments.some(c => c.body.includes(`Sign-off Recorded: ${role}`));
+                
                 if (!alreadyPosted) {
                   const timestamp = new Date().toISOString();
+                  
+                  // Comment for PR
+                  const prComment = `### ✅ Sign-off Recorded\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}`;
+                  
+                  // Comment for Issues
+                  const issueComment = `###  PR Sign-off Update\n**PR:** #${prNumber} (${pr.title})\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}\n\n---\n*Automated update from PR sign-off workflow*`;
+                  
+                  // Post to PR
                   await github.rest.issues.createComment({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
+                    owner, repo,
                     issue_number: prNumber,
-                    body: `### ✅ Sign-off Recorded\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}`
+                    body: prComment
                   });
+                  core.info(`✅ Posted sign-off to PR #${prNumber}`);
+                  
+                  // Post to ALL related issues
+                  for (const issueNum of relatedIssues) {
+                    await github.rest.issues.createComment({
+                      owner, repo,
+                      issue_number: issueNum,
+                      body: issueComment
+                    });
+                    core.info(` Posted sign-off to Issue #${issueNum}`);
+                  }
                 }
               }
             }
 
-            // 4. Set Merge Gate Status
+            // 5. Set Merge Gate Status
             const allSignedOff = checkedCount === roles.length;
             const state = allSignedOff ? 'success' : 'failure';
             const description = allSignedOff 
@@ -92,12 +135,10 @@ jobs:
               : `${checkedCount}/${roles.length} sign-offs complete`;
 
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: sha,
+              owner, repo, sha,
               state: state,
               context: 'pr-signoff-gatekeeper',
               description: description
             });
 
-            core.info(`Status set to: ${state} (${description})`);
+            core.info(`Status: ${state} - ${description}`);
