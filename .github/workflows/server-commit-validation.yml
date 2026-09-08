@@ -1,4 +1,4 @@
-name: Server-Side Commit Validation
+name: server-commit-validation
 
 on:
   push:
@@ -7,12 +7,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-# CRITICAL FOR BUDGET: Cancels redundant runs if a developer force-pushes multiple times quickly
 concurrency:
   group: commit-validation-${{ github.ref }}
   cancel-in-progress: true
 
-# LEAST PRIVILEGE: Only grants read access to what is strictly needed
 permissions:
   contents: read
   issues: read
@@ -20,10 +18,10 @@ permissions:
 
 jobs:
   validate-commits:
-    name: Validate Commits
+    name: Validate Commit Messages
     runs-on: ubuntu-latest
     steps:
-      - name: Validate Commit Messages
+      - name: validate-commit-messages
         uses: actions/github-script@v7
         env:
           ALLOW_UNKNOWN_AUTHOR: "false"
@@ -31,14 +29,12 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             async function run() {
-              // 'context', 'github', and 'core' are provided as GLOBALS by actions/github-script
               const owner = context.repo.owner;
               const repo = context.repo.repo;
               const allowUnknown = core.getInput('ALLOW_UNKNOWN_AUTHOR', { required: false }) === 'true';
-
               let commitsToCheck = [];
 
-              // 1. Determine commits to check (Zero git-fetch needed)
+              // 1. Determine commits to check
               if (context.eventName === 'pull_request') {
                 const { data: prCommits } = await github.rest.pulls.listCommits({
                   owner, repo, pull_number: context.payload.pull_request.number
@@ -66,8 +62,6 @@ jobs:
                 const sha = commit.sha || commit.id;
                 const shortSha = sha.substring(0, 7);
                 const message = commit.commit ? commit.commit.message : commit.message;
-                
-                // Only use actual GitHub login, not Git display name
                 let authorLogin = commit.author?.login;
 
                 core.info(`\n🔍 Checking [${shortSha}]: ${message.split('\n')[0]}`);
@@ -79,7 +73,7 @@ jobs:
                   continue;
                 }
 
-                // Extract refs: org/repo#123, repo#123, or #123
+                // Extract refs
                 const refs = message.match(/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+#[0-9]+|[a-zA-Z0-9_-]+#[0-9]+|#[0-9]+/g) || [];
                 if (refs.length === 0) {
                   core.error(`❌ [${shortSha}] Missing issue reference in: '${message.split('\n')[0]}'`);
@@ -87,7 +81,7 @@ jobs:
                   continue;
                 }
 
-                // Smart Fallback: Call Commit API ONLY if author login is missing from payload
+                // Smart Fallback: Call Commit API ONLY if author login is missing
                 if (!authorLogin) {
                   try {
                     const { data: commitData } = await github.rest.repos.getCommit({ owner, repo, ref: sha });
@@ -97,12 +91,11 @@ jobs:
                   }
                 }
 
-                // Final check: If we still don't have a login, handle it based on policy
                 if (!authorLogin) {
                   if (allowUnknown) {
-                    core.info(`   ℹ️ Author unknown, but ALLOW_UNKNOWN_AUTHOR is true. Proceeding with issue check.`);
+                    core.info(`   ℹ️ Author unknown, but ALLOW_UNKNOWN_AUTHOR is true.`);
                   } else {
-                    core.error(`❌ [${shortSha}] Cannot determine GitHub author. Ensure the commit email is linked to a GitHub account.`);
+                    core.error(`❌ [${shortSha}] Cannot determine GitHub author.`);
                     failed = true;
                     continue;
                   }
@@ -111,13 +104,11 @@ jobs:
                 }
 
                 let commitOk = false;
-
                 for (const ref of refs) {
                   let tOwner = owner;
                   let tRepo = repo;
                   let num = '';
 
-                  // Parse cross-repo, same-repo, or bare issue references
                   if (ref.includes('/')) {
                     const parts = ref.split('/');
                     tOwner = parts[0];
@@ -144,11 +135,10 @@ jobs:
                     }
 
                     const assignees = issue.assignees.map(a => a.login);
-                    
                     if (authorLogin && assignees.includes(authorLogin)) {
                       core.info(`   ✅ Issue ${tOwner}/${tRepo}#${num} is open and assigned to ${authorLogin}`);
                       commitOk = true;
-                      break; // Found a valid issue, stop checking other refs for this commit
+                      break;
                     } else {
                       core.info(`   ⚠️ Issue ${tOwner}/${tRepo}#${num} is open but NOT assigned to ${authorLogin}`);
                     }
