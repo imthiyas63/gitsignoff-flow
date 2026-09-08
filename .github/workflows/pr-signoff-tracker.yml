@@ -8,6 +8,7 @@ permissions:
   pull-requests: write
   contents: read
   statuses: write
+  issues: write  # ⚠️ Added: Needed to post comments on Issues
 
 jobs:
   validate-signoff:
@@ -22,26 +23,25 @@ jobs:
             const prNumber = pr.number;
             const sha = pr.head.sha;
             const body = pr.body || "";
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
             
             const author = pr.user.login;
             const sender = context.payload.sender.login;
             const roles = ['Code Review', 'QA Signoff', 'Impact Analysis Review'];
 
-            // 1. Self-Approval Blocker (Non-intrusive: fails and comments, does not mutate PR body)
+            // 1. Self-Approval Blocker
             if (author === sender) {
               const warningMessage = `### ⚠️ Self-Approval Blocked\n**@${sender}**, you cannot sign off on your own Pull Request.\n\nPlease ask another team member to review and check the boxes.`;
               
               await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner, repo,
                 issue_number: prNumber,
                 body: warningMessage
               });
 
               await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: sha,
+                owner, repo, sha,
                 state: 'failure',
                 context: 'pr-signoff-gatekeeper',
                 description: 'Self-approval is not allowed'
@@ -51,19 +51,29 @@ jobs:
               return;
             }
 
-            // 2. Validate Checkboxes
+            // 2. Extract Issue Numbers from PR body (e.g., "Closes #123", "Fixes #456")
+            const issueNumbers = [];
+            const issueRegex = /(?:Closes|Fixes|Resolves)\s+#(\d+)/gi;
+            let match;
+            while ((match = issueRegex.exec(body)) !== null) {
+              issueNumbers.push(parseInt(match[1]));
+            }
+
+            // 3. Validate Checkboxes
             let checkedCount = 0;
+            const newlyCheckedRoles = [];
+            
             for (const role of roles) {
               const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
               if (regex.test(body)) {
                 checkedCount++;
+                newlyCheckedRoles.push(role);
               }
             }
 
-            // 3. Post Audit Comments (Idempotent check to prevent spam)
+            // 4. Post Audit Comments on PR
             const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner, repo,
               issue_number: prNumber,
               per_page: 100
             });
@@ -74,17 +84,30 @@ jobs:
                 const alreadyPosted = comments.some(c => c.body.includes(`Sign-off Recorded: ${role}`));
                 if (!alreadyPosted) {
                   const timestamp = new Date().toISOString();
+                  const commentBody = `### ✅ Sign-off Recorded\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}`;
+                  
                   await github.rest.issues.createComment({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
+                    owner, repo,
                     issue_number: prNumber,
-                    body: `### ✅ Sign-off Recorded\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}`
+                    body: commentBody
                   });
+
+                  // 5. ALSO POST TO RELATED ISSUES (if any)
+                  for (const issueNum of issueNumbers) {
+                    const issueCommentBody = `### 🔗 PR Sign-off Update\n**PR:** #${prNumber}\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}\n\n---\n*Automated update from PR sign-off workflow*`;
+                    
+                    await github.rest.issues.createComment({
+                      owner, repo,
+                      issue_number: issueNum,
+                      body: issueCommentBody
+                    });
+                    core.info(`Posted sign-off to Issue #${issueNum}`);
+                  }
                 }
               }
             }
 
-            // 4. Set Merge Gate Status
+            // 6. Set Merge Gate Status
             const allSignedOff = checkedCount === roles.length;
             const state = allSignedOff ? 'success' : 'failure';
             const description = allSignedOff 
@@ -92,12 +115,13 @@ jobs:
               : `${checkedCount}/${roles.length} sign-offs complete`;
 
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: sha,
+              owner, repo, sha,
               state: state,
               context: 'pr-signoff-gatekeeper',
               description: description
             });
 
             core.info(`Status set to: ${state} (${description})`);
+            if (issueNumbers.length > 0) {
+              core.info(`Posted approvals to Issues: #${issueNumbers.join(', #')}`);
+            }
