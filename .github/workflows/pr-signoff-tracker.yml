@@ -8,7 +8,7 @@ permissions:
   pull-requests: write
   contents: read
   statuses: write
-  issues: write  # ⚠️ Added: Needed to post comments on Issues
+  issues: write  # ⚠️ CRITICAL: Allows posting comments to Issues
 
 jobs:
   validate-signoff:
@@ -51,27 +51,41 @@ jobs:
               return;
             }
 
-            // 2. Extract Issue Numbers from PR body (e.g., "Closes #123", "Fixes #456")
-            const issueNumbers = [];
-            const issueRegex = /(?:Closes|Fixes|Resolves)\s+#(\d+)/gi;
+            // 2. Extract Issue Numbers from PR body
+            // Matches: "Closes #1", "Fixes #123", "Resolves #456", or just "#1"
+            const issueNumbers = new Set();
+            
+            // Pattern 1: Closes/Fixes/Resolves #123
+            const keywordRegex = /(?:Closes|Fixes|Resolves)\s+#(\d+)/gi;
             let match;
-            while ((match = issueRegex.exec(body)) !== null) {
-              issueNumbers.push(parseInt(match[1]));
+            while ((match = keywordRegex.exec(body)) !== null) {
+              issueNumbers.add(parseInt(match[1]));
             }
+            
+            // Pattern 2: Any #number reference (e.g., "#1 testing")
+            const hashRegex = /#(\d+)/g;
+            while ((match = hashRegex.exec(body)) !== null) {
+              const num = parseInt(match[1]);
+              // Don't add the PR number itself
+              if (num !== prNumber) {
+                issueNumbers.add(num);
+              }
+            }
+
+            const relatedIssues = Array.from(issueNumbers);
+            core.info(`🔗 Found related issues: #${relatedIssues.join(', #')}`);
 
             // 3. Validate Checkboxes
             let checkedCount = 0;
-            const newlyCheckedRoles = [];
             
             for (const role of roles) {
               const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
               if (regex.test(body)) {
                 checkedCount++;
-                newlyCheckedRoles.push(role);
               }
             }
 
-            // 4. Post Audit Comments on PR
+            // 4. Post Audit Comments on PR AND Related Issues
             const { data: comments } = await github.rest.issues.listComments({
               owner, repo,
               issue_number: prNumber,
@@ -82,32 +96,38 @@ jobs:
               const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
               if (regex.test(body)) {
                 const alreadyPosted = comments.some(c => c.body.includes(`Sign-off Recorded: ${role}`));
+                
                 if (!alreadyPosted) {
                   const timestamp = new Date().toISOString();
-                  const commentBody = `### ✅ Sign-off Recorded\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}`;
                   
+                  // Comment for PR
+                  const prComment = `### ✅ Sign-off Recorded\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}`;
+                  
+                  // Comment for Issues
+                  const issueComment = `###  PR Sign-off Update\n**PR:** #${prNumber} (${pr.title})\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}\n\n---\n*Automated update from PR sign-off workflow*`;
+                  
+                  // Post to PR
                   await github.rest.issues.createComment({
                     owner, repo,
                     issue_number: prNumber,
-                    body: commentBody
+                    body: prComment
                   });
-
-                  // 5. ALSO POST TO RELATED ISSUES (if any)
-                  for (const issueNum of issueNumbers) {
-                    const issueCommentBody = `### 🔗 PR Sign-off Update\n**PR:** #${prNumber}\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}\n\n---\n*Automated update from PR sign-off workflow*`;
-                    
+                  core.info(`✅ Posted sign-off to PR #${prNumber}`);
+                  
+                  // Post to ALL related issues
+                  for (const issueNum of relatedIssues) {
                     await github.rest.issues.createComment({
                       owner, repo,
                       issue_number: issueNum,
-                      body: issueCommentBody
+                      body: issueComment
                     });
-                    core.info(`Posted sign-off to Issue #${issueNum}`);
+                    core.info(` Posted sign-off to Issue #${issueNum}`);
                   }
                 }
               }
             }
 
-            // 6. Set Merge Gate Status
+            // 5. Set Merge Gate Status
             const allSignedOff = checkedCount === roles.length;
             const state = allSignedOff ? 'success' : 'failure';
             const description = allSignedOff 
@@ -121,7 +141,4 @@ jobs:
               description: description
             });
 
-            core.info(`Status set to: ${state} (${description})`);
-            if (issueNumbers.length > 0) {
-              core.info(`Posted approvals to Issues: #${issueNumbers.join(', #')}`);
-            }
+            core.info(`Status: ${state} - ${description}`);
