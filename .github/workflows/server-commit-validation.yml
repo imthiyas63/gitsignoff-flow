@@ -1,0 +1,172 @@
+name: Server-Side Commit Validation
+
+on:
+  push:
+    branches:
+      - 'dev'
+      - 'pre-release'
+      - 'release'
+  pull_request:
+    branches:
+      - 'pre-release'
+      - 'release'
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: commit-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  validate-commits:
+    name: Validate Commits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Commit Messages
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            async function run() {
+              const owner = context.repo.owner;
+              const repo = context.repo.repo;
+              const allowUnknown = process.env.ALLOW_UNKNOWN_AUTHOR === 'true';
+
+              let commitsToCheck = [];
+
+              // Determine commits to check
+              if (context.eventName === 'pull_request') {
+                const { data: prCommits } = await github.rest.pulls.listCommits({
+                  owner, repo, pull_number: context.payload.pull_request.number
+                });
+                commitsToCheck = prCommits;
+              } else if (context.eventName === 'push') {
+                if (context.payload.deleted) {
+                  core.info('ℹ️ Branch deletion detected. Nothing to validate.');
+                  return;
+                }
+                commitsToCheck = context.payload.commits || [];
+              }
+
+              if (commitsToCheck.length === 0) {
+                core.info('✅ No new commits to validate.');
+                return;
+              }
+
+              let failed = false;
+
+              for (const commit of commitsToCheck) {
+                const sha = commit.sha || commit.id;
+                const shortSha = sha.substring(0, 7);
+                const message = commit.commit ? commit.commit.message : commit.message;
+                let authorLogin = commit.author?.login;
+
+                core.info(`\n🔍 Checking [${shortSha}]: ${message.split('\n')[0]}`);
+
+                // Skip merge/initial/revert commits
+                const parents = commit.parents || [];
+                if (parents.length > 1 || /^(Merge |Initial commit|Revert )/i.test(message)) {
+                  core.info('   ℹ️ Skipping merge/auto-generated commit');
+                  continue;
+                }
+
+                // Extract issue refs
+                const refs = message.match(/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+#[0-9]+|[a-zA-Z0-9_-]+#[0-9]+|#[0-9]+/g) || [];
+                if (refs.length === 0) {
+                  core.error(`❌ [${shortSha}] Missing issue reference in: '${message.split('\n')[0]}'`);
+                  failed = true;
+                  continue;
+                }
+
+                // Resolve author if missing
+                if (!authorLogin) {
+                  try {
+                    const { data: commitData } = await github.rest.repos.getCommit({ owner, repo, ref: sha });
+                    authorLogin = commitData.author?.login;
+                  } catch (e) {
+                    core.warning(`⚠️ Could not resolve author for ${shortSha}`);
+                  }
+                }
+
+                if (!authorLogin) {
+                  if (allowUnknown) {
+                    core.info(`   ℹ️ Author unknown, but ALLOW_UNKNOWN_AUTHOR is true.`);
+                  } else {
+                    core.error(`❌ [${shortSha}] Cannot determine GitHub author.`);
+                    failed = true;
+                    continue;
+                  }
+                } else {
+                  core.info(`   ℹ️ Author: ${authorLogin}`);
+                }
+
+                let commitOk = false;
+
+                for (const ref of refs) {
+                  let tOwner = owner;
+                  let tRepo = repo;
+                  let num = '';
+
+                  if (ref.includes('/')) {
+                    const parts = ref.split('/');
+                    tOwner = parts[0];
+                    const rest = parts[1];
+                    const hashIdx = rest.indexOf('#');
+                    tRepo = rest.substring(0, hashIdx);
+                    num = rest.substring(hashIdx + 1);
+                  } else if (ref.includes('#') && !ref.startsWith('#')) {
+                    const hashIdx = ref.indexOf('#');
+                    tRepo = ref.substring(0, hashIdx);
+                    num = ref.substring(hashIdx + 1);
+                  } else {
+                    num = ref.substring(1);
+                  }
+
+                  try {
+                    const { data: issue } = await github.rest.issues.get({
+                      owner: tOwner, repo: tRepo, issue_number: parseInt(num, 10)
+                    });
+
+                    if (issue.state !== 'open') {
+                      core.info(`   ⚠️ Issue ${tOwner}/${tRepo}#${num} is ${issue.state} — skipping.`);
+                      continue;
+                    }
+
+                    const assignees = issue.assignees.map(a => a.login);
+                    
+                    if (authorLogin && assignees.includes(authorLogin)) {
+                      core.info(`   ✅ Issue ${tOwner}/${tRepo}#${num} is open and assigned to ${authorLogin}`);
+                      commitOk = true;
+                      break;
+                    } else {
+                      core.info(`   ⚠️ Issue ${tOwner}/${tRepo}#${num} is open but NOT assigned to ${authorLogin}`);
+                    }
+                  } catch (error) {
+                    if (error.status === 404) {
+                      core.info(`   ⚠️ Issue ${tOwner}/${tRepo}#${num} not found — skipping.`);
+                    } else {
+                      core.error(`❌ API Error (HTTP ${error.status}) for ${tOwner}/${tRepo}#${num}`);
+                      failed = true;
+                      break;
+                    }
+                  }
+                }
+
+                if (!commitOk) {
+                  core.error(`❌ [${shortSha}] Must reference an open issue assigned to the author.`);
+                  failed = true;
+                }
+              }
+
+              if (failed) {
+                core.setFailed('🚨 Validation failed! Fix commit messages and force push.');
+              } else {
+                core.info('✅ All pushed commits are valid!');
+              }
+            }
+
+            run().catch(core.setFailed);
