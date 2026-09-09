@@ -4,7 +4,7 @@
 ---
 
 ## Sign-off Checklist
-> Please check the boxes below as you complete each phase. The system will automatically record your username and timestamp in the comments.
+> Please check the boxes below as you complete phase. The system will automatically record your username and timestamp in the comments.
 
 - [ ] Code Review
 - [ ] QA Signoff
