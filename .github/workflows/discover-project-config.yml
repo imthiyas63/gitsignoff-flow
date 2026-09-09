@@ -1,0 +1,87 @@
+name: Discover Project Configuration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Project and Field IDs
+        uses: actions/github-script@v7
+        id: discover
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            
+            // Get all projects for this repo
+            const query = `
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  projectsV2(first: 10) {
+                    nodes {
+                      id
+                      number
+                      title
+                      fields(first: 20) {
+                        nodes {
+                          ... on ProjectV2Field {
+                            id
+                            name
+                            dataType
+                          }
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            name
+                            dataType
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+            
+            const result = await github.graphql(query, { owner, repo });
+            const projects = result.repository.projectsV2.nodes;
+            
+            core.info(`Found ${projects.length} projects`);
+            
+            for (const project of projects) {
+              core.info(`\nProject #${project.number}: ${project.title}`);
+              core.info(`Project ID: ${project.id}`);
+              
+              const reviewersField = project.fields.nodes.find(f => 
+                f.name.toLowerCase().includes('reviewer') || 
+                f.name.toLowerCase().includes('assignee')
+              );
+              
+              if (reviewersField) {
+                core.info(`Reviewers Field: ${reviewersField.name} (${reviewersField.id})`);
+              }
+              
+              project.fields.nodes.forEach(field => {
+                core.info(`  - ${field.name}: ${field.id} (${field.dataType})`);
+              });
+            }
+            
+            // Output for manual copying
+            if (projects.length > 0) {
+              const project = projects[0];
+              core.setOutput('project_id', project.id);
+              core.setOutput('project_number', project.number);
+              
+              const reviewersField = project.fields.nodes.find(f => 
+                f.name.toLowerCase().includes('reviewer')
+              );
+              
+              if (reviewersField) {
+                core.setOutput('reviewers_field_id', reviewersField.id);
+              }
+            }
