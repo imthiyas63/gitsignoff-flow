@@ -15,7 +15,7 @@ jobs:
     name: Validate Sign-off Checkboxes
     runs-on: ubuntu-latest
     steps:
-      - name: Debug and Validate Sign-offs
+      - name: check-signoff-status
         uses: actions/github-script@v7
         with:
           script: |
@@ -30,32 +30,42 @@ jobs:
             const sender = context.payload.sender.login;
             const roles = ['Code Review', 'QA Signoff', 'Impact Analysis Review'];
 
-            core.info(`🔍 Processing PR #${prNumber}`);
-            core.info(`📝 PR Body: ${body.substring(0, 200)}...`);
+            core.info(`🔍 Processing PR #${prNumber} by @${sender}`);
 
-            // 1. Extract Issue Numbers
+            // 1. Self-Approval Blocker
+            if (author === sender) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `### ⚠️ Self-Approval Blocked\n**@${sender}**, you cannot sign off on your own PR.`
+              });
+              await github.rest.repos.createCommitStatus({
+                owner, repo, sha,
+                state: 'failure',
+                context: 'pr-signoff-gatekeeper',
+                description: 'Self-approval not allowed'
+              });
+              core.setFailed(`PR Author cannot approve their own PR`);
+              return;
+            }
+
+            // 2. Extract Issue Numbers
             const issueNumbers = new Set();
-            const keywordRegex = /(?:Closes|Fixes|Resolves|Related to)\s+#(\d+)/gi;
+            const keywordRegex = /(?:Closes|Fixes|Resolves)\s+#(\d+)/gi;
             let match;
             while ((match = keywordRegex.exec(body)) !== null) {
               issueNumbers.add(parseInt(match[1]));
-              core.info(`✅ Found issue reference: #${match[1]}`);
             }
-            
-            // Also find bare # references
             const hashRegex = /#(\d+)/g;
             while ((match = hashRegex.exec(body)) !== null) {
               const num = parseInt(match[1]);
-              if (num !== prNumber && !issueNumbers.has(num)) {
+              if (num !== prNumber) {
                 issueNumbers.add(num);
-                core.info(`✅ Found issue reference: #${num}`);
               }
             }
-            
             const relatedIssues = Array.from(issueNumbers);
-            core.info(`📋 Total related issues: ${relatedIssues.length}`);
+            core.info(`📋 Related issues: #${relatedIssues.join(', #')}`);
 
-            // 2. Count checked boxes
+            // 3. Count checked boxes
             let checkedCount = 0;
             const checkedRoles = [];
             for (const role of roles) {
@@ -63,12 +73,11 @@ jobs:
               if (regex.test(body)) {
                 checkedCount++;
                 checkedRoles.push(role);
-                core.info(`✅ Checked: ${role}`);
               }
             }
-            core.info(` Total checked: ${checkedCount}/${roles.length}`);
+            core.info(`✅ Checked: ${checkedCount}/${roles.length} - [${checkedRoles.join(', ')}]`);
 
-            // 3. Post comment on PR
+            // 4. Post comment on PR
             const { data: prComments } = await github.rest.issues.listComments({
               owner, repo, issue_number: prNumber, per_page: 100
             });
@@ -86,57 +95,20 @@ jobs:
                     owner, repo, issue_number: prNumber,
                     body: `### ✅ Sign-off Recorded\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}`
                   });
-                  core.info(`✅ Posted comment on PR #${prNumber} for ${role}`);
+                  core.info(`✅ Posted comment for ${role}`);
                 }
               }
             }
 
-            // 4. Post comments to related issues
-            for (const issueNum of relatedIssues) {
-              core.info(` Attempting to post to Issue #${issueNum}`);
-              try {
-                // Check if issue exists
-                await github.rest.issues.get({
-                  owner, repo, issue_number: issueNum
-                });
-                
-                const { data: issueComments } = await github.rest.issues.listComments({
-                  owner, repo, issue_number: issueNum, per_page: 100
-                });
-                
-                let postedCount = 0;
-                for (const role of checkedRoles) {
-                  const alreadyPosted = issueComments.some(c => 
-                    c.body.includes(`PR #${prNumber}`) && 
-                    c.body.includes(`Role: ${role}`)
-                  );
-                  
-                  if (!alreadyPosted) {
-                    await github.rest.issues.createComment({
-                      owner, repo, issue_number: issueNum,
-                      body: `### 🔗 PR Sign-off Update\n**PR:** #${prNumber}\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}\n\n---\n*Automated update from PR sign-off workflow*`
-                    });
-                    postedCount++;
-                    core.info(`✅ Posted to Issue #${issueNum}: ${role}`);
-                  }
-                }
-                
-                if (postedCount === 0) {
-                  core.info(`️ No new comments needed for Issue #${issueNum}`);
-                }
-              } catch (error) {
-                core.warning(` Could not access Issue #${issueNum}: ${error.message}`);
-              }
-            }
-
-            // 5. Update Project (if configured)
-            core.info(`📌 Attempting to update Project...`);
+            // 5. UPDATE PROJECT REVIEWERS FIELD
+            core.info(`📌 Attempting to update Project Reviewers field...`);
+            
             try {
-              // Find the project
+              // Query all projects for this repository
               const projectsQuery = `
                 query($owner: String!, $repo: String!) {
                   repository(owner: $owner, name: $repo) {
-                    projectsV2(first: 5) {
+                    projectsV2(first: 10) {
                       nodes {
                         id
                         number
@@ -164,77 +136,132 @@ jobs:
               
               core.info(`📂 Found ${projects.length} projects`);
               
+              let projectUpdated = false;
+              
               for (const project of projects) {
-                core.info(`🔍 Checking project: ${project.title} (#${project.number})`);
+                core.info(`🔍 Checking project: "${project.title}" (#${project.number})`);
+                core.info(`   Fields: ${project.fields.nodes.map(f => f.name).join(', ')}`);
                 
+                // Find "Reviewers" field
                 const reviewersField = project.fields.nodes.find(f => 
-                  f.name.toLowerCase().includes('reviewer') || 
-                  f.name.toLowerCase().includes('assignee')
+                  f.name.toLowerCase() === 'reviewers' || 
+                  f.name.toLowerCase() === 'reviewer'
                 );
                 
-                if (reviewersField) {
-                  core.info(`✅ Found Reviewers field: ${reviewersField.name} (${reviewersField.id})`);
-                  
-                  // Find the project item for this PR
-                  const itemQuery = `
-                    query($projectId: ID!, $prNumber: Int!) {
-                      projectV2(projectId: $projectId) {
-                        item(contentId: "PR_${prNumber}") {
-                          id
-                        }
+                if (!reviewersField) {
+                  core.info(`   ⚠️ No "Reviewers" field found in this project`);
+                  continue;
+                }
+                
+                core.info(`   ✅ Found Reviewers field: "${reviewersField.name}" (${reviewersField.id})`);
+                
+                // Find the project item for this PR
+                const itemQuery = `
+                  query($projectId: ID!, $prNumber: Int!) {
+                    projectV2(projectId: $projectId) {
+                      item(contentId: "PR_${prNumber}") {
+                        id
                       }
                     }
-                  `;
-                  
-                  const itemResult = await github.graphql(itemQuery, {
-                    projectId: project.id,
-                    prNumber: prNumber
-                  });
-                  
-                  const itemId = itemResult.projectV2.item?.id;
-                  
-                  if (itemId) {
-                    core.info(`✅ Found project item: ${itemId}`);
-                    
-                    const uniqueReviewers = [...new Set(checkedRoles.map((_, i) => `@${sender}`))];
-                    const reviewersText = uniqueReviewers.join(', ') || 'Pending sign-offs';
-                    
-                    const updateMutation = `
-                      mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
-                        updateProjectV2ItemFieldValue(
-                          input: {
-                            projectId: $projectId
-                            itemId: $itemId
-                            fieldId: $fieldId
-                            value: { text: $value }
-                          }
-                        ) {
-                          clientMutationId
-                        }
-                      }
-                    `;
-                    
-                    await github.graphql(updateMutation, {
-                      projectId: project.id,
-                      itemId: itemId,
-                      fieldId: reviewersField.id,
-                      value: reviewersText
-                    });
-                    
-                    core.info(`✅ Updated Project #${project.number} Reviewers field: ${reviewersText}`);
-                  } else {
-                    core.warning(`️ PR #${prNumber} not found in Project #${project.number}. Add it manually first.`);
                   }
-                } else {
-                  core.info(`ℹ️ No Reviewers field found in project ${project.title}`);
-                  core.info(`   Available fields: ${project.fields.nodes.map(f => f.name).join(', ')}`);
+                `;
+                
+                const itemResult = await github.graphql(itemQuery, {
+                  projectId: project.id,
+                  prNumber: prNumber
+                });
+                
+                const itemId = itemResult.projectV2.item?.id;
+                
+                if (!itemId) {
+                  core.warning(`   ⚠️ PR #${prNumber} is NOT in Project #${project.number}. Add it manually first!`);
+                  continue;
                 }
+                
+                core.info(`   ✅ Found project item: ${itemId}`);
+                
+                // Build reviewers text
+                const uniqueReviewers = [...new Set(checkedRoles.map(() => `@${sender}`))];
+                const reviewersText = uniqueReviewers.length > 0 
+                  ? uniqueReviewers.join(', ') 
+                  : 'Pending sign-offs';
+                
+                core.info(`   📝 Setting Reviewers to: "${reviewersText}"`);
+                
+                // Update the field
+                const updateMutation = `
+                  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
+                    updateProjectV2ItemFieldValue(
+                      input: {
+                        projectId: $projectId
+                        itemId: $itemId
+                        fieldId: $fieldId
+                        value: { text: $value }
+                      }
+                    ) {
+                      clientMutationId
+                    }
+                  }
+                `;
+                
+                await github.graphql(updateMutation, {
+                  projectId: project.id,
+                  itemId: itemId,
+                  fieldId: reviewersField.id,
+                  value: reviewersText
+                });
+                
+                core.info(`   ✅ Successfully updated Project #${project.number} Reviewers field!`);
+                projectUpdated = true;
+              }
+              
+              if (!projectUpdated) {
+                core.warning(`️ Could not update any project. Check the logs above.`);
               }
             } catch (error) {
-              core.warning(` Project update failed: ${error.message}`);
+              core.error(`❌ Project update failed: ${error.message}`);
+              core.error(`   Stack: ${error.stack}`);
             }
 
-            // 6. Update status check
+            // 6. Update Issue descriptions
+            for (const issueNum of relatedIssues) {
+              try {
+                const { data: issue } = await github.rest.issues.get({
+                  owner, repo, issue_number: issueNum
+                });
+
+                let tableRows = "";
+                for (const role of roles) {
+                  const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
+                  const isChecked = regex.test(body);
+                  const status = isChecked ? '✅ Approved' : '⏳ Pending';
+                  const signedBy = isChecked ? `@${sender}` : '-';
+                  const time = isChecked ? timestamp : '-';
+                  tableRows += `| **${role}** | ${status} | ${signedBy} | ${time} |\n`;
+                }
+
+                const signoffTable = `## PR Sign-off Status\n\n| Role | Status | Signed By | Timestamp |\n|------|--------|-----------|-----------|\n${tableRows}\n---\n*Last updated: ${timestamp} from PR #${prNumber}*`;
+
+                let newBody = issue.body || "";
+                const tableRegex = /## PR Sign-off Status[\s\S]*?(?=##|$)/;
+                
+                if (tableRegex.test(newBody)) {
+                  newBody = newBody.replace(tableRegex, signoffTable);
+                } else {
+                  newBody = newBody + "\n\n" + signoffTable;
+                }
+
+                await github.rest.issues.update({
+                  owner, repo, issue_number: issueNum,
+                  body: newBody
+                });
+                core.info(`✅ Updated Issue #${issueNum}`);
+              } catch (error) {
+                core.warning(`Could not update Issue #${issueNum}: ${error.message}`);
+              }
+            }
+
+            // 7. Update status check
             const allSignedOff = checkedCount === roles.length;
             const state = allSignedOff ? 'success' : 'pending';
             const description = `${checkedCount}/${roles.length} sign-offs complete`;
@@ -246,4 +273,4 @@ jobs:
               description: description
             });
 
-            core.info(`✅ Status set: ${state} - ${description}`);
+            core.info(`✅ Status: ${state} - ${description}`);
