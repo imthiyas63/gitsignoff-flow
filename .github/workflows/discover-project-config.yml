@@ -1,7 +1,7 @@
 name: Discover Project IDs
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # Manual trigger
 
 permissions:
   contents: read
@@ -51,34 +51,38 @@ jobs:
               }
             `;
             
-            const result = await github.graphql(query, { owner, repo });
-            const projects = result.repository.projectsV2.nodes;
-            
-            core.info(`Found ${projects.length} projects`);
-            
-            for (const project of projects) {
-              core.info(`\n Project #${project.number}: "${project.title}"`);
-              core.info(`Project ID: ${project.id}`);
+            try {
+              const result = await github.graphql(query, { owner, repo });
+              const projects = result.repository.projectsV2.nodes;
               
-              // Find "Reviewers" field
-              const reviewersField = project.fields.nodes.find(f => 
-                f.name.toLowerCase() === 'reviewers' || 
-                f.name.toLowerCase() === 'reviewer'
-              );
+              core.info(`Found ${projects.length} projects`);
               
-              if (reviewersField) {
-                core.info(`✅ Reviewers Field ID: ${reviewersField.id}`);
-                core.info(`   Field Name: ${reviewersField.name}`);
-                core.info(`   Data Type: ${reviewersField.dataType}`);
+              for (const project of projects) {
+                core.info(`\n📋 Project #${project.number}: "${project.title}"`);
+                core.info(`Project ID: ${project.id}`);
                 
-                // Output for use in other steps
-                core.setOutput('project_id', project.id);
-                core.setOutput('reviewers_field_id', reviewersField.id);
-              } else {
-                core.info(`⚠️ No "Reviewers" field found in this project`);
-                core.info(`   Available fields:`);
-                project.fields.nodes.forEach(field => {
-                  core.info(`     - ${field.name} (${field.id})`);
-                });
+                // Find "Reviewers" field
+                const reviewersField = project.fields.nodes.find(f => 
+                  f.name.toLowerCase() === 'reviewers' || 
+                  f.name.toLowerCase() === 'reviewer'
+                );
+                
+                if (reviewersField) {
+                  core.info(`✅ Reviewers Field ID: ${reviewersField.id}`);
+                  core.info(`   Field Name: ${reviewersField.name}`);
+                  core.info(`   Data Type: ${reviewersField.dataType}`);
+                  
+                  // Output for use in other steps
+                  core.setOutput('project_id', project.id);
+                  core.setOutput('reviewers_field_id', reviewersField.id);
+                } else {
+                  core.info(`️ No "Reviewers" field found in this project`);
+                  core.info(`   Available fields:`);
+                  project.fields.nodes.forEach(field => {
+                    core.info(`     - ${field.name} (${field.id})`);
+                  });
+                }
               }
+            } catch (error) {
+              core.setFailed(`Error discovering project IDs: ${error.message}`);
             }
