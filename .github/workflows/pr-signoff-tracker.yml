@@ -1,8 +1,8 @@
-name: pr-signoff-gatekeeper
+name: PR Sign-off Gatekeeper
 
 on:
   pull_request:
-    types: [edited]
+    types: [edited, opened, synchronize]
 
 permissions:
   pull-requests: write
@@ -15,6 +15,66 @@ jobs:
     name: Validate Sign-off Checkboxes
     runs-on: ubuntu-latest
     steps:
+      - name: Discover Project Configuration
+        id: discover
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            
+            // Query to find projects dynamically
+            const query = `
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  projectsV2(first: 10) {
+                    nodes {
+                      id
+                      number
+                      title
+                      fields(first: 50) {
+                        nodes {
+                          ... on ProjectV2Field {
+                            id
+                            name
+                            dataType
+                          }
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            name
+                            dataType
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+            
+            const result = await github.graphql(query, { owner, repo });
+            const projects = result.repository.projectsV2.nodes;
+            
+            let projectId = '';
+            let reviewersFieldId = '';
+            
+            for (const project of projects) {
+              const reviewersField = project.fields.nodes.find(f => 
+                f.name.toLowerCase().includes('reviewer') || 
+                f.name.toLowerCase().includes('assignee')
+              );
+              
+              if (reviewersField) {
+                projectId = project.id;
+                reviewersFieldId = reviewersField.id;
+                console.log(`✅ Using Project #${project.number}: "${project.title}"`);
+                break;
+              }
+            }
+            
+            core.setOutput('project_id', projectId);
+            core.setOutput('reviewers_field_id', reviewersFieldId);
+
       - name: Check sign-off status and update Project
         uses: actions/github-script@v7
         with:
@@ -30,12 +90,16 @@ jobs:
             const author = pr.user.login;
             const sender = context.payload.sender.login;
             const roles = ['Code Review', 'QA Signoff', 'Impact Analysis Review'];
-
-            console.log(`🔍 Processing PR #${prNumber} edited by @${sender}`);
-
+            
+            // Get project IDs from previous step
+            const projectId = '${{ steps.discover.outputs.project_id }}';
+            const reviewersFieldId = '${{ steps.discover.outputs.reviewers_field_id }}';
+            
+            console.log(` Processing PR #${prNumber} edited by @${sender}`);
+            
             // 1. Self-Approval Blocker
             if (author === sender) {
-              console.log(`️ Self-approval detected!`);
+              console.log(`⚠️ Self-approval detected!`);
               await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber,
                 body: `### ⚠️ Self-Approval Blocked\n**@${sender}**, you cannot sign off on your own PR.`
@@ -49,7 +113,7 @@ jobs:
               core.setFailed(`PR Author cannot approve their own PR`);
               return;
             }
-
+            
             // 2. Extract Issue Numbers from PR body
             const issueNumbers = new Set();
             const keywordRegex = /(?:Closes|Fixes|Resolves)\s+#(\d+)/gi;
@@ -69,7 +133,7 @@ jobs:
             
             const relatedIssues = Array.from(issueNumbers);
             console.log(`📋 Related issues: #${relatedIssues.join(', #')}`);
-
+            
             // 3. Count checked boxes
             let checkedCount = 0;
             const checkedRoles = [];
@@ -82,12 +146,12 @@ jobs:
               }
             }
             console.log(`📊 Total checked: ${checkedCount}/${roles.length}`);
-
+            
             // 4. Post comment on PR
             const { data: prComments } = await github.rest.issues.listComments({
               owner, repo, issue_number: prNumber, per_page: 100
             });
-
+            
             const timestamp = new Date().toISOString();
             for (const role of roles) {
               const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
@@ -105,61 +169,12 @@ jobs:
                 }
               }
             }
-
-            // 5. UPDATE PROJECT REVIEWERS FIELD
-            console.log(` Attempting to update Project Reviewers field...`);
             
-            try {
-              // Query to find projects
-              const projectsQuery = `
-                query($owner: String!, $repo: String!) {
-                  repository(owner: $owner, name: $repo) {
-                    projectsV2(first: 10) {
-                      nodes {
-                        id
-                        number
-                        title
-                        fields(first: 20) {
-                          nodes {
-                            ... on ProjectV2Field {
-                              id
-                              name
-                            }
-                            ... on ProjectV2SingleSelectField {
-                              id
-                              name
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              `;
+            // 5. UPDATE PROJECT REVIEWERS FIELD (if project found)
+            if (projectId && reviewersFieldId) {
+              console.log(`📌 Attempting to update Project Reviewers field...`);
               
-              const projectsResult = await github.graphql(projectsQuery, { owner, repo });
-              const projects = projectsResult.repository.projectsV2.nodes;
-              
-              console.log(`📂 Found ${projects.length} projects`);
-              
-              let projectUpdated = false;
-              
-              for (const project of projects) {
-                console.log(` Checking project: "${project.title}" (#${project.number})`);
-                
-                // Find "Reviewers" field
-                const reviewersField = project.fields.nodes.find(f => 
-                  f.name.toLowerCase() === 'reviewers' || 
-                  f.name.toLowerCase() === 'reviewer'
-                );
-                
-                if (!reviewersField) {
-                  console.log(`   ⚠️ No "Reviewers" field found in this project`);
-                  continue;
-                }
-                
-                console.log(`   ✅ Found Reviewers field: "${reviewersField.name}" (${reviewersField.id})`);
-                
+              try {
                 // Find the project item for this PR
                 const itemQuery = `
                   query($projectId: ID!, $prNumber: Int!) {
@@ -172,62 +187,57 @@ jobs:
                 `;
                 
                 const itemResult = await github.graphql(itemQuery, {
-                  projectId: project.id,
-                  prNumber: prNumber
+                  projectId,
+                  prNumber
                 });
                 
                 const itemId = itemResult.projectV2.item?.id;
                 
                 if (!itemId) {
-                  console.log(`   ⚠️ PR #${prNumber} is NOT in Project #${project.number}. Add it manually first!`);
-                  continue;
-                }
-                
-                console.log(`   ✅ Found project item: ${itemId}`);
-                
-                // Build reviewers text
-                const uniqueReviewers = [...new Set(checkedRoles.map(() => `@${sender}`))];
-                const reviewersText = uniqueReviewers.length > 0 
-                  ? uniqueReviewers.join(', ') 
-                  : 'Pending sign-offs';
-                
-                console.log(`   📝 Setting Reviewers to: "${reviewersText}"`);
-                
-                // Update the field using GraphQL mutation
-                const updateMutation = `
-                  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
-                    updateProjectV2ItemFieldValue(
-                      input: {
-                        projectId: $projectId
-                        itemId: $itemId
-                        fieldId: $fieldId
-                        value: { text: $value }
+                  console.log(`   ⚠️ PR #${prNumber} is NOT in Project. Add it manually first!`);
+                } else {
+                  console.log(`   ✅ Found project item: ${itemId}`);
+                  
+                  // Build reviewers text
+                  const uniqueReviewers = [...new Set(checkedRoles.map(() => `@${sender}`))];
+                  const reviewersText = uniqueReviewers.length > 0 
+                    ? uniqueReviewers.join(', ') 
+                    : 'Pending sign-offs';
+                  
+                  console.log(`   📝 Setting Reviewers to: "${reviewersText}"`);
+                  
+                  // Update the field using GraphQL mutation
+                  const updateMutation = `
+                    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
+                      updateProjectV2ItemFieldValue(
+                        input: {
+                          projectId: $projectId
+                          itemId: $itemId
+                          fieldId: $fieldId
+                          value: { text: $value }
+                        }
+                      ) {
+                        clientMutationId
                       }
-                    ) {
-                      clientMutationId
                     }
-                  }
-                `;
-                
-                await github.graphql(updateMutation, {
-                  projectId: project.id,
-                  itemId: itemId,
-                  fieldId: reviewersField.id,
-                  value: reviewersText
-                });
-                
-                console.log(`   ✅ Successfully updated Project #${project.number} Reviewers field!`);
-                projectUpdated = true;
+                  `;
+                  
+                  await github.graphql(updateMutation, {
+                    projectId,
+                    itemId,
+                    fieldId: reviewersFieldId,
+                    value: reviewersText
+                  });
+                  
+                  console.log(`   ✅ Successfully updated Project Reviewers field!`);
+                }
+              } catch (error) {
+                console.error(`❌ Project update failed: ${error.message}`);
               }
-              
-              if (!projectUpdated) {
-                console.log(`⚠️ Could not update any project. Check the logs above.`);
-              }
-            } catch (error) {
-              console.error(` Project update failed: ${error.message}`);
-              console.error(`   Stack: ${error.stack}`);
+            } else {
+              console.log(`⚠️ No project configuration found. Skipping Project update.`);
             }
-
+            
             // 6. Update Issue descriptions
             for (const issueNum of relatedIssues) {
               try {
@@ -235,7 +245,7 @@ jobs:
                 const { data: issue } = await github.rest.issues.get({
                   owner, repo, issue_number: issueNum
                 });
-
+                
                 let tableRows = "";
                 for (const role of roles) {
                   const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
@@ -245,9 +255,9 @@ jobs:
                   const time = isChecked ? timestamp : '-';
                   tableRows += `| **${role}** | ${status} | ${signedBy} | ${time} |\n`;
                 }
-
+                
                 const signoffTable = `## PR Sign-off Status\n\n| Role | Status | Signed By | Timestamp |\n|------|--------|-----------|-----------|\n${tableRows}\n---\n*Last updated: ${timestamp} from PR #${prNumber}*`;
-
+                
                 let newBody = issue.body || "";
                 const tableRegex = /## PR Sign-off Status[\s\S]*?(?=##|$)/;
                 
@@ -256,7 +266,7 @@ jobs:
                 } else {
                   newBody = newBody + "\n\n" + signoffTable;
                 }
-
+                
                 await github.rest.issues.update({
                   owner, repo, issue_number: issueNum,
                   body: newBody
@@ -267,17 +277,17 @@ jobs:
                 console.warn(`⚠️ Could not update Issue #${issueNum}: ${error.message}`);
               }
             }
-
+            
             // 7. Update status check
             const allSignedOff = checkedCount === roles.length;
             const state = allSignedOff ? 'success' : 'pending';
             const description = `${checkedCount}/${roles.length} sign-offs complete`;
-
+            
             await github.rest.repos.createCommitStatus({
               owner, repo, sha,
               state: state,
               context: 'pr-signoff-gatekeeper',
               description: description
             });
-
+            
             console.log(`✅ Status: ${state} - ${description}`);

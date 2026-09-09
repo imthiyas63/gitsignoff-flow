@@ -1,7 +1,9 @@
-name: Discover Project IDs
+name: Discover Project Configuration
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0'  # Run weekly to keep values updated
 
 permissions:
   contents: read
@@ -11,20 +13,22 @@ jobs:
   discover:
     runs-on: ubuntu-latest
     outputs:
-      project_id: ${{ steps.get-ids.outputs.project_id }}
-      reviewers_field_id: ${{ steps.get-ids.outputs.reviewers_field_id }}
+      project_id: ${{ steps.get-config.outputs.project_id }}
+      project_number: ${{ steps.get-config.outputs.project_number }}
+      reviewers_field_id: ${{ steps.get-config.outputs.reviewers_field_id }}
+      status_field_id: ${{ steps.get-config.outputs.status_field_id }}
     steps:
       - name: Get Project and Field IDs
-        id: get-ids
+        id: get-config
         uses: actions/github-script@v7
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             
-            console.log(`🔍 Searching for projects in ${owner}/${repo}...`);
+            console.log(`🔍 Discovering projects in ${owner}/${repo}...`);
             
-            // Query to find projects and their fields
+            // Query to find all projects and their fields
             const query = `
               query($owner: String!, $repo: String!) {
                 repository(owner: $owner, name: $repo) {
@@ -33,7 +37,7 @@ jobs:
                       id
                       number
                       title
-                      fields(first: 20) {
+                      fields(first: 50) {
                         nodes {
                           ... on ProjectV2Field {
                             id
@@ -44,6 +48,10 @@ jobs:
                             id
                             name
                             dataType
+                            options {
+                              id
+                              name
+                            }
                           }
                         }
                       }
@@ -58,35 +66,61 @@ jobs:
             
             console.log(`✅ Found ${projects.length} projects`);
             
+            let foundProject = null;
+            let reviewersField = null;
+            let statusField = null;
+            
             for (const project of projects) {
-              console.log(`\n Project #${project.number}: "${project.title}"`);
+              console.log(`\n📋 Project #${project.number}: "${project.title}"`);
               console.log(`   Project ID: ${project.id}`);
               
               // Find "Reviewers" field (case-insensitive)
-              const reviewersField = project.fields.nodes.find(f => 
+              reviewersField = project.fields.nodes.find(f => 
                 f.name.toLowerCase().includes('reviewer') || 
                 f.name.toLowerCase().includes('assignee')
               );
               
-              if (reviewersField) {
-                console.log(`   ✅ Found Reviewers field!`);
-                console.log(`      Field Name: ${reviewersField.name}`);
-                console.log(`      Field ID: ${reviewersField.id}`);
-                console.log(`      Data Type: ${reviewersField.dataType}`);
-                
-                // Output for use in other steps
-                core.setOutput('project_id', project.id);
-                core.setOutput('reviewers_field_id', reviewersField.id);
-                core.setOutput('project_number', project.number);
-              } else {
-                console.log(`   ⚠️ No "Reviewers" field found in this project`);
-                console.log(`   Available fields:`);
-                project.fields.nodes.forEach(field => {
-                  console.log(`     - ${field.name} (${field.id}) [${field.dataType}]`);
-                });
+              // Find "Status" field
+              statusField = project.fields.nodes.find(f => 
+                f.name.toLowerCase() === 'status'
+              );
+              
+              if (reviewersField || statusField) {
+                foundProject = project;
+                console.log(`   ✅ Selected this project`);
+                break;
               }
             }
             
-            if (projects.length === 0) {
-              core.setFailed('No projects found in this repository');
+            if (!foundProject) {
+              core.setFailed('No project with Reviewers or Status field found');
+              return;
+            }
+            
+            // Output the discovered values
+            core.setOutput('project_id', foundProject.id);
+            core.setOutput('project_number', foundProject.number);
+            
+            if (reviewersField) {
+              core.setOutput('reviewers_field_id', reviewersField.id);
+              console.log(`   ✅ Reviewers Field: "${reviewersField.name}" (${reviewersField.id})`);
+            } else {
+              console.log(`   ⚠️ No Reviewers field found`);
+              core.setOutput('reviewers_field_id', '');
+            }
+            
+            if (statusField) {
+              core.setOutput('status_field_id', statusField.id);
+              console.log(`   ✅ Status Field: "${statusField.name}" (${statusField.id})`);
+            } else {
+              console.log(`   ⚠️ No Status field found`);
+              core.setOutput('status_field_id', '');
+            }
+            
+            // Save to repository variables for other workflows
+            console.log('\n💡 To use these values in other workflows:');
+            console.log(`   Go to Settings → Actions → Variables`);
+            console.log(`   Add: PROJECT_ID = ${foundProject.id}`);
+            if (reviewersField) {
+              console.log(`   Add: REVIEWERS_FIELD_ID = ${reviewersField.id}`);
             }
