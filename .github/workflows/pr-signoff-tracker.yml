@@ -52,27 +52,66 @@ jobs:
               owner, repo, issue_number: prNumber, per_page: 100
             });
 
-            // 3. Find the sign-off comment (look for our marker)
+            // 3. Find the sign-off comment and parse existing data
             const signoffComment = comments.find(c => 
               c.body && c.body.includes("<!-- PR-SIGNOFF-STATUS -->")
             );
 
-            // 4. Build the sign-off data JSON
+            let existingSignoffData = {};
+            if (signoffComment) {
+              try {
+                const match = signoffComment.body.match(/```json\s*([\s\S]*?)\s*```/);
+                if (match) {
+                  existingSignoffData = JSON.parse(match[1]);
+                }
+              } catch (e) {
+                console.log("⚠️ Could not parse existing sign-off data");
+              }
+            }
+
+            // 4. SECURITY CHECK: Prevent PR Author from stealing sign-offs
+            let authorAttemptingSignoff = false;
+            for (const role of roles) {
+              const regex = new RegExp(`^\\s*-\\s*\\[[xX]\\]\\s*${escapeRegex(role)}\\s*$`, "im");
+              if (regex.test(body)) {
+                // If the box is checked, and there is NO existing signer, OR the existing signer IS the author
+                if (!existingSignoffData[role] || existingSignoffData[role] === actor) {
+                  authorAttemptingSignoff = true;
+                  break;
+                }
+              }
+            }
+
+            if (actor === prAuthor && authorAttemptingSignoff) {
+              console.log(`⚠️ Self-approval detected: @${actor} is the PR author.`);
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `### ⚠️ Self-Approval Blocked\n**@${actor}**, you cannot sign off on your own PR. Please ask another team member to review and check the boxes.`
+              });
+              await github.rest.repos.createCommitStatus({
+                owner, repo, sha, state: 'failure',
+                context: 'pr-signoff-gatekeeper', description: 'Self-approval not allowed'
+              });
+              core.setFailed(`PR Author (@${actor}) cannot approve their own PR.`);
+              return;
+            }
+
+            // 5. Build the sign-off data JSON (Preserve existing signers)
             const signoffData = {};
             for (const role of roles) {
               const regex = new RegExp(`^\\s*-\\s*\\[[xX]\\]\\s*${escapeRegex(role)}\\s*$`, "im");
               if (regex.test(body)) {
-                // Find who checked this box (use actor for newly checked, or keep existing)
-                signoffData[role] = actor;
+                // Keep the original signer, or use the current actor if it's a new sign-off
+                signoffData[role] = existingSignoffData[role] || actor;
               }
             }
 
-            // 5. Build the table HTML
+            // 6. Build the table HTML
             const tableRows = roles.map(role => {
               const signer = signoffData[role];
               return signer 
                 ? `| **${role}** | ✅ Approved | @${signer} |`
-                : `| **${role}** |  Pending | - |`;
+                : `| **${role}** | ⏳ Pending | - |`;
             }).join("\n");
 
             const commentBody = `<!-- PR-SIGNOFF-STATUS -->
@@ -88,22 +127,20 @@ ${JSON.stringify(signoffData, null, 2)}
 ${tableRows}
 `;
 
-            // 6. UPDATE existing comment or CREATE new one
+            // 7. UPDATE existing comment or CREATE new one (Prevents duplicates)
             if (signoffComment) {
-              // Update the existing comment
               await github.rest.issues.updateComment({
                 owner, repo, comment_id: signoffComment.id, body: commentBody
               });
               console.log("✅ Updated existing sign-off comment");
             } else {
-              // Create new comment
               await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber, body: commentBody
               });
               console.log("✅ Created new sign-off comment");
             }
 
-            // 7. Find and Update Linked Issues
+            // 8. Find and Update Linked Issues (e.g., #16)
             const issueNumbers = new Set();
             const keywordRegex = /(?:Closes|Fixes|Resolves)\s+#(\d+)/gi;
             let match;
@@ -127,7 +164,7 @@ ${tableRows}
                   const signer = signoffData[role];
                   return signer 
                     ? `| **${role}** | ✅ Approved | @${signer} |`
-                    : `| **${role}** |  Pending | - |`;
+                    : `| **${role}** | ⏳ Pending | - |`;
                 }).join("\n");
 
                 const issueSignoffTable = `<!-- PR-SIGNOFF-STATUS -->
@@ -158,7 +195,7 @@ ${issueTableRows}
               }
             }
 
-            // 8. Set Commit Status for Branch Protection
+            // 9. Set Commit Status for Branch Protection
             const allSignedOff = roles.every(role => signoffData[role]);
             const checkedCount = Object.keys(signoffData).length;
             
