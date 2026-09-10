@@ -9,7 +9,7 @@ permissions:
   issues: write
   pull-requests: write
   statuses: write
-  repository-projects: write
+  projects: write
 
 jobs:
   validate-signoff:
@@ -44,10 +44,12 @@ jobs:
               const regex = new RegExp(`^\\s*-\\s*\\[[xX]\\]\\s*${escapeRegex(role)}\\s*$`, "im");
               if (regex.test(body)) {
                 signoffData[role] = actor;
+                console.log(`✅ ${role}: @${actor}`);
+              } else {
+                console.log(` ${role}: Pending`);
               }
             }
             const checkedCount = Object.keys(signoffData).length;
-            console.log(`Progress: ${checkedCount}/${roles.length}`);
 
             // 2. Generate status table
             const tableRows = roles.map(role => {
@@ -72,35 +74,30 @@ jobs:
             *Last updated: ${new Date().toISOString()}*
             `;
 
-            // 3. Update or create comment on PR
-            try {
-              const { data: comments } = await github.rest.issues.listComments({
-                owner, repo, issue_number: prNumber, per_page: 100
+            // 3. Update PR comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: prNumber, per_page: 100
+            });
+
+            const existingComment = comments.find(c => c.body && c.body.includes(signoffMarker));
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existingComment.id, body: commentBody
               });
-
-              const existingComment = comments.find(c => c.body && c.body.includes(signoffMarker));
-
-              if (existingComment) {
-                await github.rest.issues.updateComment({
-                  owner, repo, comment_id: existingComment.id, body: commentBody
-                });
-                console.log(`Updated comment #${existingComment.id}`);
-              } else {
-                await github.rest.issues.createComment({
-                  owner, repo, issue_number: prNumber, body: commentBody
-                });
-                console.log(`Created new sign-off comment`);
-              }
-            } catch (error) {
-              console.error(`Comment error: ${error.message}`);
+              console.log(`✅ Updated comment`);
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber, body: commentBody
+              });
+              console.log(`✅ Created comment`);
             }
 
-            // 4. Update Project field (Checks for PR AND linked Issues)
-            try {
-              const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";
-              const SIGNOFF_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";
+            // 4. Update Project field
+            const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";
+            const SIGNOFF_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";
 
-              // Find all project items
+            try {
               const projectQuery = `
                 query($projectId: ID!) {
                   node(id: $projectId) {
@@ -122,7 +119,7 @@ jobs:
               const projectData = await github.graphql(projectQuery, { projectId: PROJECT_ID });
               const project = projectData.node;
               
-              // Collect numbers to look for: The PR number + any issues mentioned in body (e.g., #25)
+              // Find PR number and any linked issue numbers
               const numbersToFind = new Set([prNumber]);
               const issueRegex = /#(\d+)/g;
               let match;
@@ -130,7 +127,6 @@ jobs:
                 numbersToFind.add(parseInt(match[1], 10));
               }
 
-              // Find project items that match our numbers
               const itemsToUpdate = project.items.nodes.filter(item => 
                 numbersToFind.has(item.content?.number)
               );
@@ -141,7 +137,6 @@ jobs:
                   return signer ? `${role}: @${signer}` : `${role}: Pending`;
                 }).join("\\n");
 
-                // Update each matching item
                 for (const item of itemsToUpdate) {
                   await github.graphql(`
                     mutation {
@@ -162,10 +157,11 @@ jobs:
                   console.log(`✅ Updated Project item #${item.content.number}`);
                 }
               } else {
-                console.log("⚠️ Neither PR nor linked issues found in project");
+                console.log("⚠️ No matching items found in project");
               }
             } catch (error) {
-              console.log(`⚠️ Project update skipped: ${error.message}`);
+              console.log(`❌ Project update failed: ${error.message}`);
+              throw error; // Re-throw to make workflow fail visibly
             }
 
             // 5. Set commit status
