@@ -9,7 +9,7 @@ permissions:
   issues: write
   pull-requests: write
   statuses: write
-  projects: write
+  repository-projects: write  # <-- FIXED: Changed from 'projects' to 'repository-projects'
 
 jobs:
   validate-signoff:
@@ -127,10 +127,11 @@ jobs:
               );
 
               if (projectItem) {
+                // Using " | " separator to prevent GraphQL syntax errors with newlines
                 const statusText = roles.map(role => {
                   const signer = signoffData[role];
                   return signer ? `${role}: @${signer}` : `${role}: Pending`;
-                }).join("\\n");
+                }).join(" | ");
 
                 await github.graphql(`
                   mutation {
@@ -167,4 +168,4 @@ jobs:
               description: `${checkedCount}/${roles.length} sign-offs complete`
             });
 
-            console.log(allSignedOff ? "✅ ALL SIGN-OFFS COMPLETE" : ` ${checkedCount}/${roles.length} complete`);
+            console.log(allSignedOff ? "✅ ALL SIGN-OFFS COMPLETE" : `⏳ ${checkedCount}/${roles.length} complete`);
