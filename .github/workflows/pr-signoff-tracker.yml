@@ -1,4 +1,4 @@
-name: pr-signoff-gatekeeper
+name: PR Sign-off Gatekeeper
 
 on:
   pull_request:
@@ -15,7 +15,7 @@ jobs:
     name: Validate Sign-off Checkboxes
     runs-on: ubuntu-latest
     steps:
-      - name: check-signoff-status
+      - name: Check sign-offs, update Project, and request reviewers
         uses: actions/github-script@v7
         with:
           script: |
@@ -30,8 +30,11 @@ jobs:
             const sender = context.payload.sender.login;
             const roles = ['Code Review', 'QA Signoff', 'Impact Analysis Review'];
 
+            console.log(`🔍 Processing PR #${prNumber} edited by @${sender}`);
+
             // 1. Self-Approval Blocker
             if (author === sender) {
+              console.log(`⚠️ Self-approval detected!`);
               await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber,
                 body: `### ⚠️ Self-Approval Blocked\n**@${sender}**, you cannot sign off on your own PR.`
@@ -46,108 +49,156 @@ jobs:
               return;
             }
 
-            // 2. Extract Issue Numbers from PR body
+            // 2. Extract Issue Numbers
             const issueNumbers = new Set();
             const keywordRegex = /(?:Closes|Fixes|Resolves)\s+#(\d+)/gi;
             let match;
             while ((match = keywordRegex.exec(body)) !== null) {
               issueNumbers.add(parseInt(match[1]));
             }
-            const hashRegex = /#(\d+)/g;
-            while ((match = hashRegex.exec(body)) !== null) {
-              const num = parseInt(match[1]);
-              if (num !== prNumber) {
-                issueNumbers.add(num);
-              }
-            }
-            const relatedIssues = Array.from(issueNumbers);
 
-            // 3. Count currently checked boxes and track who signed
+            // 3. Count checked boxes
             let checkedCount = 0;
-            const signoffData = {};
+            const checkedRoles = [];
             for (const role of roles) {
               const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
               if (regex.test(body)) {
                 checkedCount++;
-                signoffData[role] = {
-                  signed: true,
-                  by: sender,
-                  at: new Date().toISOString()
-                };
-              } else {
-                signoffData[role] = { signed: false, by: null, at: null };
+                checkedRoles.push(role);
+                console.log(`✅ Checked: ${role}`);
               }
             }
+            console.log(`📊 Total checked: ${checkedCount}/${roles.length}`);
 
-            // 4. Post comment on PR (for PR audit trail)
+            // 4. Post comment on PR
             const { data: prComments } = await github.rest.issues.listComments({
               owner, repo, issue_number: prNumber, per_page: 100
             });
 
             const timestamp = new Date().toISOString();
             for (const role of roles) {
-              if (signoffData[role].signed) {
+              const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
+              if (regex.test(body)) {
                 const alreadyRecorded = prComments.some(c => 
                   c.body.includes(`Sign-off Recorded: ${role}`) && 
                   !c.body.includes(`Revoked`)
                 );
-                
                 if (!alreadyRecorded) {
                   await github.rest.issues.createComment({
                     owner, repo, issue_number: prNumber,
                     body: `### ✅ Sign-off Recorded\n**Role:** ${role}\n**Signed by:** @${sender}\n**Timestamp:** ${timestamp}`
                   });
+                  console.log(`✅ Posted comment for ${role}`);
                 }
               }
             }
 
-            // 5. UPDATE ISSUE DESCRIPTION (Text Field)
-            for (const issueNum of relatedIssues) {
+            // 5. ADD LABELS (Auto-syncs to Projects!)
+            const labelMap = {
+              'Code Review': 'signoff:code-review',
+              'QA Signoff': 'signoff:qa-signoff',
+              'Impact Analysis Review': 'signoff:impact-analysis'
+            };
+
+            const { data: currentLabels } = await github.rest.issues.listLabelsOnIssue({
+              owner, repo, issue_number: prNumber
+            });
+
+            for (const label of currentLabels) {
+              if (label.name.startsWith('signoff:')) {
+                await github.rest.issues.removeLabel({
+                  owner, repo, issue_number: prNumber, name: label.name
+                });
+                console.log(`🏷️ Removed label: ${label.name}`);
+              }
+            }
+
+            for (const role of checkedRoles) {
+              const labelName = labelMap[role];
+              if (labelName) {
+                try {
+                  await github.rest.issues.addLabels({
+                    owner, repo, issue_number: prNumber, labels: [labelName]
+                  });
+                  console.log(`🏷️ Added label: ${labelName}`);
+                } catch (error) {
+                  console.log(`⚠️ Label ${labelName} might not exist yet`);
+                }
+              }
+            }
+
+            // 5b. REQUEST REAL REVIEWER (Populates Project Reviewers column natively!)
+            if (checkedCount > 0) {
+              const alreadyRequested = (pr.requested_reviewers || []).some(u => u.login === sender);
+              if (!alreadyRequested) {
+                try {
+                  await github.rest.pulls.requestReviewers({
+                    owner, repo, pull_number: prNumber,
+                    reviewers: [sender]
+                  });
+                  console.log(`👀 Requested @${sender} as a reviewer`);
+                } catch (error) {
+                  console.log(`⚠️ Could not request @${sender} as reviewer: ${error.message}`);
+                }
+              }
+            }
+
+            // 5c. NUDGE FOR OFFICIAL APPROVAL (When all 3 are checked)
+            if (checkedCount === roles.length) {
+              const nudgeText = "### 🎉 All Sign-offs Recorded!\n\nAll checklist items have been signed off. Please remember to submit an **official GitHub Review Approval** to satisfy branch protection rules and enable the Merge button.";
+              
+              const alreadyNudged = prComments.some(c => c.body.includes("All Sign-offs Recorded!"));
+              if (!alreadyNudged) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber,
+                  body: nudgeText
+                });
+                console.log(`✅ Posted official approval nudge`);
+              }
+            }
+
+            // 6. Update Issue descriptions
+            for (const issueNum of issueNumbers) {
               try {
-                // Get current issue
+                console.log(`📝 Attempting to update Issue #${issueNum}...`);
                 const { data: issue } = await github.rest.issues.get({
                   owner, repo, issue_number: issueNum
                 });
 
-                // Build the markdown table safely
-                const tableRows = Object.entries(signoffData).map(([role, data]) => {
-                  const status = data.signed ? '✅ Approved' : '⏳ Pending';
-                  const signedBy = data.signed ? `@${data.by}` : '-';
-                  const time = data.signed ? data.at : '-';
-                  return `| **${role}** | ${status} | ${signedBy} | ${time} |`;
-                }).join('\n');
+                let tableRows = "";
+                for (const role of roles) {
+                  const regex = new RegExp(`- \\[[xX]\\]\\s+${role}`, 'i');
+                  const isChecked = regex.test(body);
+                  const status = isChecked ? '✅ Approved' : '⏳ Pending';
+                  const signedBy = isChecked ? `@${sender}` : '-';
+                  const time = isChecked ? timestamp : '-';
+                  tableRows += `| **${role}** | ${status} | ${signedBy} | ${time} |\n`;
+                }
 
-                const signoffTable = [
-                  '## PR Sign-off Status',
-                  '',
-                  '| Role | Status | Signed By | Timestamp |',
-                  '|------|--------|-----------|-----------|',
-                  tableRows,
-                  '',
-                  '---',
-                  `*Last updated: ${new Date().toISOString()} from PR #${prNumber}*`
-                ].join('\n');
+                const signoffTable = `## PR Sign-off Status\n\n| Role | Status | Signed By | Timestamp |\n|------|--------|-----------|-----------|\n${tableRows}\n---\n*Last updated: ${timestamp} from PR #${prNumber}*`;
 
-                // Update issue body - replace existing table or append
-                let newBody = issue.body || '';
-                if (newBody.includes('## PR Sign-off Status')) {
-                  newBody = newBody.replace(/## PR Sign-off Status[\s\S]*?(?=##|$)/, signoffTable);
+                let newBody = issue.body || "";
+                const tableRegex = /## PR Sign-off Status[\s\S]*?(?=##|$)/;
+                
+                if (tableRegex.test(newBody)) {
+                  newBody = newBody.replace(tableRegex, signoffTable);
                 } else {
-                  newBody = newBody + '\n\n' + signoffTable;
+                  newBody = newBody + "\n\n" + signoffTable;
                 }
 
                 await github.rest.issues.update({
                   owner, repo, issue_number: issueNum,
                   body: newBody
                 });
-
-                core.info(`Updated Issue #${issueNum} description with sign-off table`);
+                
+                console.log(`✅ Updated Issue #${issueNum}`);
               } catch (error) {
-                core.warning(`Could not update Issue #${issueNum}: ${error.message}`);
+                console.warn(`⚠️ Could not update Issue #${issueNum}: ${error.message}`);
+                // Continue even if issue update fails (e.g., issue doesn't exist)
               }
             }
 
-            // 6. Update status check
+            // 7. Update status check
             const allSignedOff = checkedCount === roles.length;
             const state = allSignedOff ? 'success' : 'pending';
             const description = `${checkedCount}/${roles.length} sign-offs complete`;
@@ -159,4 +210,4 @@ jobs:
               description: description
             });
 
-            core.info(`Status: ${state} - ${description}`);
+            console.log(`✅ Status: ${state} - ${description}`);
