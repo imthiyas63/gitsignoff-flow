@@ -7,7 +7,6 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  projects: write
 
 jobs:
   update-qa-field:
@@ -16,32 +15,37 @@ jobs:
       - name: Update QA Sign-off in Project
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # CRITICAL: Uses your PAT with Project write access
+          github-token: ${{ secrets.PROJECTS_PAT }}
           script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
             const prNumber = context.payload.pull_request.number;
             const actor = context.actor;
             const labels = context.payload.pull_request.labels.map(l => l.name);
-            
-            // Your exact Project and Field IDs from your GraphQL output
-            const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";  
-            const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";  
-            
+
+            // Hardcoded Project and Field IDs from your GraphQL output
+            const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";
+            const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";
+
             const isQaApproved = labels.includes('qa-approved') || labels.includes('QA Signoff');
             const qaValue = isQaApproved ? `Approved by @${actor}` : 'Pending QA Review';
-            
+
             console.log(`PR #${prNumber}`);
             console.log(`Labels: ${labels.join(', ')}`);
             console.log(`QA Status: ${qaValue}`);
-            
+
             try {
-              // CORRECT QUERY: Fetch items and find the one matching the PR number
+              // Find the ProjectV2 item that corresponds to this PR.
+              // Projects V2 has no server-side filter by content number, so we
+              // page through all items and match client-side.
               const itemQuery = `
-                query($projectId: ID!, $prNumber: Int!) {
+                query($projectId: ID!, $cursor: String) {
                   node(id: $projectId) {
                     ... on ProjectV2 {
-                      items(first: 100) {
+                      items(first: 100, after: $cursor) {
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
                         nodes {
                           id
                           content {
@@ -58,52 +62,60 @@ jobs:
                   }
                 }
               `;
-              
-              const itemResult = await github.graphql(itemQuery, {
-                projectId: PROJECT_ID,
-                prNumber: prNumber
-              });
-              
-              // Filter the items to find the one that matches our PR number
-              const projectItems = itemResult.node.items.nodes;
-              const projectItem = projectItems.find(item => 
-                item.content && item.content.number === prNumber
-              );
-              
-              const itemId = projectItem ? projectItem.id : null;
-              
+
+              let itemId = null;
+              let cursor = null;
+              let hasNextPage = true;
+
+              while (hasNextPage && !itemId) {
+                const result = await github.graphql(itemQuery, {
+                  projectId: PROJECT_ID,
+                  cursor: cursor
+                });
+
+                const itemsConnection = result.node.items;
+                const match = itemsConnection.nodes.find(
+                  item => item.content && item.content.number === prNumber
+                );
+
+                if (match) {
+                  itemId = match.id;
+                  break;
+                }
+
+                hasNextPage = itemsConnection.pageInfo.hasNextPage;
+                cursor = itemsConnection.pageInfo.endCursor;
+              }
+
               if (!itemId) {
                 console.log(`⚠️ PR #${prNumber} is not in the project. Add it manually first.`);
                 return;
               }
-              
+
               console.log(`✅ Found project item ID: ${itemId}`);
-              
-              // Update the QA Sign-off field
+
+              // Update the QA Sign-off text field
               const mutation = `
                 mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
-                  updateProjectV2ItemFieldValue(
-                    input: {
-                      projectId: $projectId
-                      itemId: $itemId
-                      fieldId: $fieldId
-                      value: { text: $value }
-                    }
-                  ) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { text: $value }
+                  }) {
                     clientMutationId
                   }
                 }
               `;
-              
+
               await github.graphql(mutation, {
                 projectId: PROJECT_ID,
                 itemId: itemId,
                 fieldId: QA_FIELD_ID,
                 value: qaValue
               });
-              
-              console.log(`✅ Successfully updated "QA Sign-off" field to: "${qaValue}"`);
-              
+
+              console.log(`🎉 Successfully updated "QA Sign-off" field to: "${qaValue}"`);
             } catch (error) {
               console.error(`❌ Failed to update QA field: ${error.message}`);
               core.setFailed(error.message);
