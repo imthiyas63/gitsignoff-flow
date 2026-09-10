@@ -72,7 +72,7 @@ jobs:
             *Last updated: ${new Date().toISOString()}*
             `;
 
-            // 3. Update or create comment
+            // 3. Update or create comment on PR
             try {
               const { data: comments } = await github.rest.issues.listComments({
                 owner, repo, issue_number: prNumber, per_page: 100
@@ -95,11 +95,12 @@ jobs:
               console.error(`Comment error: ${error.message}`);
             }
 
-            // 4. Update Project field
+            // 4. Update Project field (Checks for PR AND linked Issues)
             try {
               const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";
               const SIGNOFF_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";
 
+              // Find all project items
               const projectQuery = `
                 query($projectId: ID!) {
                   node(id: $projectId) {
@@ -108,9 +109,8 @@ jobs:
                         nodes {
                           id
                           content {
-                            ... on PullRequest {
-                              number
-                            }
+                            ... on Issue { number }
+                            ... on PullRequest { number }
                           }
                         }
                       }
@@ -122,36 +122,47 @@ jobs:
               const projectData = await github.graphql(projectQuery, { projectId: PROJECT_ID });
               const project = projectData.node;
               
-              const projectItem = project.items.nodes.find(
-                item => item.content?.number === prNumber
+              // Collect numbers to look for: The PR number + any issues mentioned in body (e.g., #25)
+              const numbersToFind = new Set([prNumber]);
+              const issueRegex = /#(\d+)/g;
+              let match;
+              while ((match = issueRegex.exec(body)) !== null) {
+                numbersToFind.add(parseInt(match[1], 10));
+              }
+
+              // Find project items that match our numbers
+              const itemsToUpdate = project.items.nodes.filter(item => 
+                numbersToFind.has(item.content?.number)
               );
 
-              if (projectItem) {
+              if (itemsToUpdate.length > 0) {
                 const statusText = roles.map(role => {
                   const signer = signoffData[role];
                   return signer ? `${role}: @${signer}` : `${role}: Pending`;
                 }).join("\\n");
 
-                await github.graphql(`
-                  mutation {
-                    updateProjectV2ItemFieldValue(
-                      input: {
-                        projectId: "${PROJECT_ID}"
-                        itemId: "${projectItem.id}"
-                        fieldId: "${SIGNOFF_FIELD_ID}"
-                        value: {
-                          text: "${statusText}"
+                // Update each matching item
+                for (const item of itemsToUpdate) {
+                  await github.graphql(`
+                    mutation {
+                      updateProjectV2ItemFieldValue(
+                        input: {
+                          projectId: "${PROJECT_ID}"
+                          itemId: "${item.id}"
+                          fieldId: "${SIGNOFF_FIELD_ID}"
+                          value: {
+                            text: "${statusText}"
+                          }
                         }
+                      ) {
+                        projectV2Item { id }
                       }
-                    ) {
-                      projectV2Item { id }
                     }
-                  }
-                `);
-                
-                console.log("✅ Updated Project field");
+                  `);
+                  console.log(`✅ Updated Project item #${item.content.number}`);
+                }
               } else {
-                console.log("⚠️ PR not in project yet (add it manually)");
+                console.log("⚠️ Neither PR nor linked issues found in project");
               }
             } catch (error) {
               console.log(`⚠️ Project update skipped: ${error.message}`);
