@@ -1,106 +1,93 @@
-name: QA Sign-off Tracker
+name: Update QA Sign-off Field
 
 on:
   pull_request:
-    types: [opened, edited, reopened, synchronize]
+    types: [labeled, unlabeled, edited]
 
 permissions:
   contents: read
   pull-requests: write
-  issues: write
   projects: write
 
 jobs:
   update-qa-field:
     runs-on: ubuntu-latest
     steps:
-      - name: Update QA Signoff Field
+      - name: Update QA Sign-off in Project
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const pr = context.payload.pull_request;
-            const prNumber = pr.number;
-            const body = pr.body || "";
+            const prNumber = context.payload.pull_request.number;
             const actor = context.actor;
-
-            console.log(`Processing PR #${prNumber}`);
-
-            // Check if QA Signoff is checked
-            const qaChecked = /^-\s*\[[xX]\]\s*QA Signoff\s*$/im.test(body);
+            const labels = context.payload.pull_request.labels.map(l => l.name);
             
-            if (!qaChecked) {
-              console.log("QA Signoff not checked - skipping");
-              return;
-            }
-
-            console.log(`✅ QA Signoff checked by @${actor}`);
-
-            // Your project configuration
-            const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";
-            const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY"; // REPLACE with actual QA Signoff field ID
-
+            // Your exact Project and Field IDs from GraphQL
+            const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";  // Testing Project #2
+            const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";  // QA Sign-off field
+            
+            // Determine the value based on labels
+            const isQaApproved = labels.includes('qa-approved') || labels.includes('QA Signoff');
+            const qaValue = isQaApproved ? `Approved by @${actor}` : 'Pending QA Review';
+            
+            console.log(`PR #${prNumber}`);
+            console.log(`Labels: ${labels.join(', ')}`);
+            console.log(`QA Status: ${qaValue}`);
+            
             try {
-              // Find all project items
-              const projectQuery = `
-                query($projectId: ID!) {
-                  node(id: $projectId) {
-                    ... on ProjectV2 {
-                      items(first: 100) {
-                        nodes {
-                          id
-                          content {
-                            ... on Issue { number }
-                            ... on PullRequest { number }
-                          }
-                        }
-                      }
+              // Find the project item for this PR
+              const itemQuery = `
+                query($projectId: ID!, $prNumber: Int!) {
+                  projectV2(projectId: $projectId) {
+                    item(contentId: "PR_${prNumber}") {
+                      id
                     }
                   }
                 }
               `;
-
-              const projectData = await github.graphql(projectQuery, { projectId: PROJECT_ID });
-              const project = projectData.node;
-
-              // Find items matching this PR or linked issues
-              const numbersToFind = new Set([prNumber]);
-              const issueRegex = /#(\d+)/g;
-              let match;
-              while ((match = issueRegex.exec(body)) !== null) {
-                numbersToFind.add(parseInt(match[1], 10));
+              
+              const itemResult = await github.graphql(itemQuery, {
+                projectId: PROJECT_ID,
+                prNumber: prNumber
+              });
+              
+              const itemId = itemResult.projectV2.item?.id;
+              
+              if (!itemId) {
+                console.log(`⚠️ PR #${prNumber} is not in the project. Add it manually first.`);
+                return;
               }
-
-              const itemsToUpdate = project.items.nodes.filter(item => 
-                numbersToFind.has(item.content?.number)
-              );
-
-              console.log(`Found ${itemsToUpdate.length} items to update`);
-
-              // Update the QA Signoff field
-              for (const item of itemsToUpdate) {
-                await github.graphql(`
-                  mutation {
-                    updateProjectV2ItemFieldValue(
-                      input: {
-                        projectId: "${PROJECT_ID}"
-                        itemId: "${item.id}"
-                        fieldId: "${QA_FIELD_ID}"
-                        value: {
-                          text: "@${actor}"
-                        }
-                      }
-                    ) {
-                      projectV2Item { id }
+              
+              console.log(`✅ Found project item: ${itemId}`);
+              
+              // Update the QA Sign-off field
+              const mutation = `
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
+                  updateProjectV2ItemFieldValue(
+                    input: {
+                      projectId: $projectId
+                      itemId: $itemId
+                      fieldId: $fieldId
+                      value: { text: $value }
                     }
+                  ) {
+                    clientMutationId
                   }
-                `);
-                console.log(`✅ Updated QA Signoff for #${item.content.number}`);
-              }
-
+                }
+              `;
+              
+              await github.graphql(mutation, {
+                projectId: PROJECT_ID,
+                itemId: itemId,
+                fieldId: QA_FIELD_ID,
+                value: qaValue
+              });
+              
+              console.log(`✅ Successfully updated "QA Sign-off" field to: "${qaValue}"`);
+              
             } catch (error) {
-              console.error(`❌ Failed to update project: ${error.message}`);
-              throw error;
+              console.error(`❌ Failed to update QA field: ${error.message}`);
+              core.setFailed(error.message);
             }
