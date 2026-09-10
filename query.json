@@ -1,0 +1,3 @@
+{
+  "query": "query { user(login: \"imthiyas63\") { projectsV2(first: 10) { nodes { id number title fields(first: 30) { nodes { ... on ProjectV2FieldCommon { id name } } } } } } }"
+}
