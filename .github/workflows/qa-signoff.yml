@@ -109,11 +109,33 @@ jobs:
               }
 
               if (!itemId) {
-                console.log(`PR #${prNumber} is not in the project. Add it manually first.`);
-                return;
+                // PR isn't on the board yet -- add it automatically instead of
+                // requiring someone to drag it on manually.
+                console.log(`PR #${prNumber} is not in the project yet. Adding it now.`);
+
+                const addMutation = `
+                  mutation($projectId: ID!, $contentId: ID!) {
+                    addProjectV2ItemById(input: {
+                      projectId: $projectId
+                      contentId: $contentId
+                    }) {
+                      item {
+                        id
+                      }
+                    }
+                  }
+                `;
+
+                const addResult = await github.graphql(addMutation, {
+                  projectId: PROJECT_ID,
+                  contentId: context.payload.pull_request.node_id
+                });
+
+                itemId = addResult.addProjectV2ItemById.item.id;
+                console.log(`Added PR #${prNumber} to the project.`);
               }
 
-              console.log(`Found project item ID: ${itemId}`);
+              console.log(`Project item ID: ${itemId}`);
 
               // Update the QA Sign-off text field
               const mutation = `
