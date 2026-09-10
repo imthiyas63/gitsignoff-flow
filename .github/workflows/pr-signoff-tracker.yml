@@ -31,6 +31,23 @@ jobs:
 
             console.log("PR SIGN-OFF GATEKEEPER START");
 
+            // Helper function to retry API calls on 500 errors
+            async function getCommentsWithRetry(maxRetries = 3) {
+              for (let i = 0; i < maxRetries; i++) {
+                try {
+                  const { data } = await github.rest.issues.listComments({
+                    owner, repo, issue_number: prNumber, per_page: 100
+                  });
+                  return data;
+                } catch (error) {
+                  console.log(`⚠️ API call attempt ${i + 1} failed: ${error.message}`);
+                  if (i === maxRetries - 1) throw error;
+                  console.log("Retrying in 2 seconds...");
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+              }
+            }
+
             const roles = ["Code Review", "QA Signoff", "Impact Analysis Review"];
 
             function escapeRegex(value) {
@@ -48,9 +65,9 @@ jobs:
             console.log(`Checked: ${checkedRoles.length}/${roles.length}`);
 
             const signoffMarker = "<!-- PR-SIGNOFF-DATA -->";
-            const { data: comments } = await github.rest.issues.listComments({
-              owner, repo, issue_number: prNumber, per_page: 100
-            });
+            
+            // Use the retry helper here
+            const comments = await getCommentsWithRetry();
 
             let existingSignoffData = {};
             const dataComment = comments.find(c => c.body && c.body.includes(signoffMarker));
