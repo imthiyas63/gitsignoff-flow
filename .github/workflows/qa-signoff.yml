@@ -1,13 +1,25 @@
 name: Update QA Sign-off Field
 
+# Fires when the PR description is edited, e.g. when someone checks the
+# "QA Signoff" checkbox in the sign-off checklist template.
 on:
   pull_request:
-    types: [edited, synchronize]
+    types: [edited]
 
+# NOTE: There is no valid `projects` permission key for GITHUB_TOKEN.
+# Projects V2 (the new org-level Projects board) cannot be granted write
+# access via the `permissions:` block at all -- GITHUB_TOKEN simply has no
+# scope for it. `repository-projects` only covers classic (v1) projects.
+#
+# You must create a Personal Access Token with Projects V2 write access
+# (classic PAT with the `project` scope, or a fine-grained PAT with
+# organization "Projects: Read and write" permission), then save it as a
+# repo secret, e.g. PROJECTS_PAT. Use that secret as the github-script
+# `github-token` input below -- do not use secrets.GITHUB_TOKEN for the
+# GraphQL calls, it will 403 no matter what you put in `permissions:`.
 permissions:
   contents: read
   pull-requests: write
-  issues: write
 
 jobs:
   update-qa-field:
@@ -16,57 +28,36 @@ jobs:
       - name: Update QA Sign-off in Project
         uses: actions/github-script@v7
         with:
+          # Requires a PAT with Projects V2 write access, see note above.
           github-token: ${{ secrets.PROJECTS_PAT }}
           script: |
             const prNumber = context.payload.pull_request.number;
             const actor = context.actor;
-            const body = context.payload.pull_request.body || "";
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            
-            // Hardcoded Project and Field IDs
+            const body = context.payload.pull_request.body || '';
+
+            // Hardcoded Project and Field IDs from your GraphQL output
             const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";
             const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";
 
-            // Check if "QA Signoff" checkbox is checked
-            const qaCheckboxRegex = /- \[[xX]\]\s*QA Signoff/i;
-            const isQaApproved = qaCheckboxRegex.test(body);
+            // The PR description contains a markdown checklist, e.g.:
+            //   - [x] QA Signoff
+            // We detect whether that specific item is checked. context.actor
+            // is whoever last edited the PR body (i.e. whoever ticked the box).
+            const qaCheckboxRegex = /-\s*\[([xX])\]\s*QA\s*Signoff/;
+            const match = body.match(qaCheckboxRegex);
+            const isQaApproved = !!match;
             const qaValue = isQaApproved ? `Approved by @${actor}` : 'Pending QA Review';
 
             console.log(`PR #${prNumber}`);
-            console.log(`QA Checkbox: ${isQaApproved ? 'Checked ✅' : 'Unchecked ☐'}`);
+            console.log(`QA Signoff checkbox checked: ${isQaApproved}`);
             console.log(`QA Status: ${qaValue}`);
 
             try {
-              // Step 1: Find linked issue numbers from PR body
-              const issueNumbers = [];
-              const keywordRegex = /(?:Closes|Fixes|Resolves)\s+#(\d+)/gi;
-              let match;
-              while ((match = keywordRegex.exec(body)) !== null) {
-                issueNumbers.push(parseInt(match[1], 10));
-              }
-              
-              // Also check for bare # references
-              const hashRegex = /#(\d+)/g;
-              while ((match = hashRegex.exec(body)) !== null) {
-                const num = parseInt(match[1], 10);
-                if (num !== prNumber && !issueNumbers.includes(num)) {
-                  issueNumbers.push(num);
-                }
-              }
-
-              console.log(`Found linked issue numbers: ${issueNumbers.join(', ') || 'none'}`);
-
-              if (issueNumbers.length === 0) {
-                console.log(`⚠️ No linked issues found in PR #${prNumber} description.`);
-                console.log(` Add "Closes #XX" or "#XX" to the PR description.`);
-                return;
-              }
-
-              // Step 2: Find which of these issues is in the project
-              let itemId = null;
-              let foundIssueNumber = null;
-
+              // Find the ProjectV2 item that corresponds to this PR.
+              // Projects V2 has no server-side filter by content number, so we
+              // page through all items and match client-side. $prNumber must
+              // NOT be declared in the query signature since it's never used
+              // inside the query body itself (GraphQL rejects unused variables).
               const itemQuery = `
                 query($projectId: ID!, $cursor: String) {
                   node(id: $projectId) {
@@ -79,10 +70,10 @@ jobs:
                         nodes {
                           id
                           content {
-                            ... on Issue {
+                            ... on PullRequest {
                               number
                             }
-                            ... on PullRequest {
+                            ... on Issue {
                               number
                             }
                           }
@@ -93,6 +84,7 @@ jobs:
                 }
               `;
 
+              let itemId = null;
               let cursor = null;
               let hasNextPage = true;
 
@@ -103,32 +95,27 @@ jobs:
                 });
 
                 const itemsConnection = result.node.items;
-                
-                for (const item of itemsConnection.nodes) {
-                  if (item.content && item.content.__typename === 'Issue') {
-                    if (issueNumbers.includes(item.content.number)) {
-                      itemId = item.id;
-                      foundIssueNumber = item.content.number;
-                      break;
-                    }
-                  }
+                const match = itemsConnection.nodes.find(
+                  item => item.content && item.content.number === prNumber
+                );
+
+                if (match) {
+                  itemId = match.id;
+                  break;
                 }
 
-                if (!itemId) {
-                  hasNextPage = itemsConnection.pageInfo.hasNextPage;
-                  cursor = itemsConnection.pageInfo.endCursor;
-                }
+                hasNextPage = itemsConnection.pageInfo.hasNextPage;
+                cursor = itemsConnection.pageInfo.endCursor;
               }
 
               if (!itemId) {
-                console.log(`⚠️ None of the linked issues (${issueNumbers.join(', ')}) are in the project.`);
-                console.log(`👉 Add one of these issues to the "Testing" project board.`);
+                console.log(`PR #${prNumber} is not in the project. Add it manually first.`);
                 return;
               }
 
-              console.log(`✅ Found Issue #${foundIssueNumber} in project. Item ID: ${itemId}`);
+              console.log(`Found project item ID: ${itemId}`);
 
-              // Step 3: Update the QA Sign-off field
+              // Update the QA Sign-off text field
               const mutation = `
                 mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
                   updateProjectV2ItemFieldValue(input: {
@@ -149,8 +136,8 @@ jobs:
                 value: qaValue
               });
 
-              console.log(`🎉 Successfully updated Issue #${foundIssueNumber} "QA Sign-off" field to: "${qaValue}"`);
+              console.log(`Successfully updated "QA Sign-off" field to: "${qaValue}"`);
             } catch (error) {
-              console.error(`❌ Failed to update QA field: ${error.message}`);
+              console.error(`Failed to update QA field: ${error.message}`);
               core.setFailed(error.message);
             }
