@@ -7,8 +7,6 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  # 'projects: write' removed to bypass YAML validator error. 
-  # The token inherits write access from your Repository Settings.
 
 jobs:
   update-qa-field:
@@ -26,8 +24,9 @@ jobs:
             const labels = context.payload.pull_request.labels.map(l => l.name);
             
             // Your exact Project and Field IDs from your GraphQL output
-            const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";  
-            const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";  
+            // Project #2 "Testing"
+            const PROJECT_NUMBER = 2; 
+            const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";  // "Sign-off Status" field
             
             // Determine the value based on labels
             const isQaApproved = labels.includes('qa-approved') || labels.includes('QA Signoff');
@@ -38,26 +37,32 @@ jobs:
             console.log(`QA Status: ${qaValue}`);
             
             try {
-              // 1. Find the project item for this PR
+              // 1. Find the project item for this PR using the correct User query
               const itemQuery = `
-                query($projectId: ID!, $prNumber: Int!) {
-                  projectV2(projectId: $projectId) {
-                    item(contentId: "PR_${prNumber}") {
+                query($owner: String!, $projectNumber: Int!, $prNumber: Int!) {
+                  user(login: $owner) {
+                    projectV2(number: $projectNumber) {
                       id
+                      item(contentId: "PR_${prNumber}") {
+                        id
+                      }
                     }
                   }
                 }
               `;
               
               const itemResult = await github.graphql(itemQuery, {
-                projectId: PROJECT_ID,
+                owner: owner,
+                projectNumber: PROJECT_NUMBER,
                 prNumber: prNumber
               });
               
-              const itemId = itemResult.projectV2.item?.id;
+              const project = itemResult.user.projectV2;
+              const itemId = project?.item?.id;
+              const projectId = project?.id;
               
-              if (!itemId) {
-                console.log(`⚠️ PR #${prNumber} is not in the project. Add it manually first.`);
+              if (!itemId || !projectId) {
+                console.log(`⚠️ PR #${prNumber} is not in Project #${PROJECT_NUMBER}. Add it manually first.`);
                 return;
               }
               
@@ -80,13 +85,13 @@ jobs:
               `;
               
               await github.graphql(mutation, {
-                projectId: PROJECT_ID,
+                projectId: projectId,
                 itemId: itemId,
                 fieldId: QA_FIELD_ID,
                 value: qaValue
               });
               
-              console.log(`✅ Successfully updated "QA Sign-off" field to: "${qaValue}"`);
+              console.log(`✅ Successfully updated "Sign-off Status" field to: "${qaValue}"`);
               
             } catch (error) {
               console.error(`❌ Failed to update QA field: ${error.message}`);
