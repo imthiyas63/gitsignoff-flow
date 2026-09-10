@@ -23,12 +23,10 @@ jobs:
             const actor = context.actor;
             const labels = context.payload.pull_request.labels.map(l => l.name);
             
-            // Your exact Project and Field IDs from your GraphQL output
-            // Project #2 "Testing"
-            const PROJECT_NUMBER = 2; 
-            const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";  // "Sign-off Status" field
+            // Your exact Project and Field IDs
+            const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";  
+            const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";  
             
-            // Determine the value based on labels
             const isQaApproved = labels.includes('qa-approved') || labels.includes('QA Signoff');
             const qaValue = isQaApproved ? `Approved by @${actor}` : 'Pending QA Review';
             
@@ -37,12 +35,11 @@ jobs:
             console.log(`QA Status: ${qaValue}`);
             
             try {
-              // 1. Find the project item for this PR using the correct User query
+              // CORRECTED QUERY: Use 'node' interface to access ProjectV2
               const itemQuery = `
-                query($owner: String!, $projectNumber: Int!, $prNumber: Int!) {
-                  user(login: $owner) {
-                    projectV2(number: $projectNumber) {
-                      id
+                query($projectId: ID!, $prNumber: Int!) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
                       item(contentId: "PR_${prNumber}") {
                         id
                       }
@@ -52,23 +49,20 @@ jobs:
               `;
               
               const itemResult = await github.graphql(itemQuery, {
-                owner: owner,
-                projectNumber: PROJECT_NUMBER,
+                projectId: PROJECT_ID,
                 prNumber: prNumber
               });
               
-              const project = itemResult.user.projectV2;
-              const itemId = project?.item?.id;
-              const projectId = project?.id;
+              const itemId = itemResult.node?.item?.id;
               
-              if (!itemId || !projectId) {
-                console.log(`⚠️ PR #${prNumber} is not in Project #${PROJECT_NUMBER}. Add it manually first.`);
+              if (!itemId) {
+                console.log(`⚠️ PR #${prNumber} is not in the project. Add it manually first.`);
                 return;
               }
               
               console.log(`✅ Found project item: ${itemId}`);
               
-              // 2. Update the QA Sign-off field
+              // Update the QA Sign-off field
               const mutation = `
                 mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
                   updateProjectV2ItemFieldValue(
@@ -85,13 +79,13 @@ jobs:
               `;
               
               await github.graphql(mutation, {
-                projectId: projectId,
+                projectId: PROJECT_ID,
                 itemId: itemId,
                 fieldId: QA_FIELD_ID,
                 value: qaValue
               });
               
-              console.log(`✅ Successfully updated "Sign-off Status" field to: "${qaValue}"`);
+              console.log(`✅ Successfully updated "QA Sign-off" field to: "${qaValue}"`);
               
             } catch (error) {
               console.error(`❌ Failed to update QA field: ${error.message}`);
