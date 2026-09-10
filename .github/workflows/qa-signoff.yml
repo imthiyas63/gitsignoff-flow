@@ -53,24 +53,41 @@ jobs:
             console.log(`QA Signoff checkbox checked: ${isQaApproved}`);
             console.log(`QA Status: ${qaValue}`);
 
-            // Extract linked issue numbers from closing keywords, e.g.
-            // "Closes #33", "Fixes #33, #34", "Resolves #33". This is how we
-            // find the ISSUE row on the board that this PR belongs to, instead
-            // of creating a separate row for the PR itself.
-            const closingKeywordRegex = /\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s*:?\s*((#\d+[\s,]*)+)/gi;
-            const issueNumbers = new Set();
-            let kwMatch;
-            while ((kwMatch = closingKeywordRegex.exec(body)) !== null) {
-              const numbers = kwMatch[3].match(/#(\d+)/g) || [];
-              numbers.forEach(n => issueNumbers.add(Number(n.slice(1))));
-            }
+            // Find issues linked to this PR. This covers BOTH:
+            //  - closing keywords in the PR body (Closes/Fixes/Resolves #N)
+            //  - issues linked manually via the "Development" sidebar on the
+            //    PR or issue (which is how imthiyas63/gitsignoff-flow#33 was
+            //    linked -- no keyword in the body at all).
+            // closingIssuesReferences reflects both cases.
+            const linkedIssuesQuery = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    closingIssuesReferences(first: 20) {
+                      nodes {
+                        id
+                        number
+                      }
+                    }
+                  }
+                }
+              }
+            `;
 
-            if (issueNumbers.size === 0) {
-              console.log('No linked issue found via closing keywords (Closes/Fixes/Resolves #N). Skipping project update.');
+            const linkedIssuesResult = await github.graphql(linkedIssuesQuery, {
+              owner: owner,
+              repo: repo,
+              number: prNumber
+            });
+
+            const linkedIssues = linkedIssuesResult.repository.pullRequest.closingIssuesReferences.nodes;
+
+            if (linkedIssues.length === 0) {
+              console.log('No linked issue found (no closing keyword and no Development link). Skipping project update.');
               return;
             }
 
-            console.log(`Linked issue(s): ${[...issueNumbers].join(', ')}`);
+            console.log(`Linked issue(s): ${linkedIssues.map(i => i.number).join(', ')}`);
 
             // Finds the ProjectV2 item id for a given content number (issue or PR).
             // Projects V2 has no server-side filter by content number, so we
@@ -150,30 +167,9 @@ jobs:
             }
 
             try {
-              for (const issueNumber of issueNumbers) {
-                // Look up the issue's node id (needed to add it to the project
-                // if it isn't already on the board).
-                const issueQuery = `
-                  query($owner: String!, $repo: String!, $number: Int!) {
-                    repository(owner: $owner, name: $repo) {
-                      issue(number: $number) {
-                        id
-                      }
-                    }
-                  }
-                `;
-
-                const issueResult = await github.graphql(issueQuery, {
-                  owner: owner,
-                  repo: repo,
-                  number: issueNumber
-                });
-
-                const issueNodeId = issueResult.repository.issue && issueResult.repository.issue.id;
-                if (!issueNodeId) {
-                  console.log(`Issue #${issueNumber} not found in ${owner}/${repo}, skipping.`);
-                  continue;
-                }
+              for (const issue of linkedIssues) {
+                const issueNumber = issue.number;
+                const issueNodeId = issue.id;
 
                 let itemId = await findProjectItemByNumber(issueNumber);
 
