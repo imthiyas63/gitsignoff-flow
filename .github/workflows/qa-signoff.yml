@@ -1,0 +1,106 @@
+name: QA Sign-off Tracker
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  projects: write
+
+jobs:
+  update-qa-field:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update QA Signoff Field
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            const prNumber = pr.number;
+            const body = pr.body || "";
+            const actor = context.actor;
+
+            console.log(`Processing PR #${prNumber}`);
+
+            // Check if QA Signoff is checked
+            const qaChecked = /^-\s*\[[xX]\]\s*QA Signoff\s*$/im.test(body);
+            
+            if (!qaChecked) {
+              console.log("QA Signoff not checked - skipping");
+              return;
+            }
+
+            console.log(`✅ QA Signoff checked by @${actor}`);
+
+            // Your project configuration
+            const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";
+            const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY"; // REPLACE with actual QA Signoff field ID
+
+            try {
+              // Find all project items
+              const projectQuery = `
+                query($projectId: ID!) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      items(first: 100) {
+                        nodes {
+                          id
+                          content {
+                            ... on Issue { number }
+                            ... on PullRequest { number }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+
+              const projectData = await github.graphql(projectQuery, { projectId: PROJECT_ID });
+              const project = projectData.node;
+
+              // Find items matching this PR or linked issues
+              const numbersToFind = new Set([prNumber]);
+              const issueRegex = /#(\d+)/g;
+              let match;
+              while ((match = issueRegex.exec(body)) !== null) {
+                numbersToFind.add(parseInt(match[1], 10));
+              }
+
+              const itemsToUpdate = project.items.nodes.filter(item => 
+                numbersToFind.has(item.content?.number)
+              );
+
+              console.log(`Found ${itemsToUpdate.length} items to update`);
+
+              // Update the QA Signoff field
+              for (const item of itemsToUpdate) {
+                await github.graphql(`
+                  mutation {
+                    updateProjectV2ItemFieldValue(
+                      input: {
+                        projectId: "${PROJECT_ID}"
+                        itemId: "${item.id}"
+                        fieldId: "${QA_FIELD_ID}"
+                        value: {
+                          text: "@${actor}"
+                        }
+                      }
+                    ) {
+                      projectV2Item { id }
+                    }
+                  }
+                `);
+                console.log(`✅ Updated QA Signoff for #${item.content.number}`);
+              }
+
+            } catch (error) {
+              console.error(`❌ Failed to update project: ${error.message}`);
+              throw error;
+            }
