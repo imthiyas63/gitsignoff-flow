@@ -7,6 +7,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  projects: write
 
 jobs:
   update-qa-field:
@@ -72,7 +73,7 @@ jobs:
               const itemId = projectItem ? projectItem.id : null;
               
               if (!itemId) {
-                console.log(`⚠️ PR #${prNumber} is not in the project. Please add it manually first.`);
+                console.log(`⚠️ PR #${prNumber} is not in the project. Add it manually first.`);
                 return;
               }
               
