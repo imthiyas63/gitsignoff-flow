@@ -2,11 +2,12 @@ name: Update QA Sign-off Field
 
 on:
   pull_request:
-    types: [labeled, unlabeled, edited]
+    types: [edited, synchronize]
 
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 jobs:
   update-qa-field:
@@ -15,28 +16,57 @@ jobs:
       - name: Update QA Sign-off in Project
         uses: actions/github-script@v7
         with:
-          # CRITICAL: Uses your PAT with Project write access
           github-token: ${{ secrets.PROJECTS_PAT }}
           script: |
             const prNumber = context.payload.pull_request.number;
             const actor = context.actor;
-            const labels = context.payload.pull_request.labels.map(l => l.name);
-
-            // Hardcoded Project and Field IDs from your GraphQL output
+            const body = context.payload.pull_request.body || "";
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            
+            // Hardcoded Project and Field IDs
             const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";
             const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";
 
-            const isQaApproved = labels.includes('qa-approved') || labels.includes('QA Signoff');
+            // Check if "QA Signoff" checkbox is checked
+            const qaCheckboxRegex = /- \[[xX]\]\s*QA Signoff/i;
+            const isQaApproved = qaCheckboxRegex.test(body);
             const qaValue = isQaApproved ? `Approved by @${actor}` : 'Pending QA Review';
 
             console.log(`PR #${prNumber}`);
-            console.log(`Labels: ${labels.join(', ')}`);
+            console.log(`QA Checkbox: ${isQaApproved ? 'Checked ✅' : 'Unchecked ☐'}`);
             console.log(`QA Status: ${qaValue}`);
 
             try {
-              // Find the ProjectV2 item that corresponds to this PR.
-              // Projects V2 has no server-side filter by content number, so we
-              // page through all items and match client-side.
+              // Step 1: Find linked issue numbers from PR body
+              const issueNumbers = [];
+              const keywordRegex = /(?:Closes|Fixes|Resolves)\s+#(\d+)/gi;
+              let match;
+              while ((match = keywordRegex.exec(body)) !== null) {
+                issueNumbers.push(parseInt(match[1], 10));
+              }
+              
+              // Also check for bare # references
+              const hashRegex = /#(\d+)/g;
+              while ((match = hashRegex.exec(body)) !== null) {
+                const num = parseInt(match[1], 10);
+                if (num !== prNumber && !issueNumbers.includes(num)) {
+                  issueNumbers.push(num);
+                }
+              }
+
+              console.log(`Found linked issue numbers: ${issueNumbers.join(', ') || 'none'}`);
+
+              if (issueNumbers.length === 0) {
+                console.log(`⚠️ No linked issues found in PR #${prNumber} description.`);
+                console.log(` Add "Closes #XX" or "#XX" to the PR description.`);
+                return;
+              }
+
+              // Step 2: Find which of these issues is in the project
+              let itemId = null;
+              let foundIssueNumber = null;
+
               const itemQuery = `
                 query($projectId: ID!, $cursor: String) {
                   node(id: $projectId) {
@@ -49,10 +79,10 @@ jobs:
                         nodes {
                           id
                           content {
-                            ... on PullRequest {
+                            ... on Issue {
                               number
                             }
-                            ... on Issue {
+                            ... on PullRequest {
                               number
                             }
                           }
@@ -63,7 +93,6 @@ jobs:
                 }
               `;
 
-              let itemId = null;
               let cursor = null;
               let hasNextPage = true;
 
@@ -74,27 +103,32 @@ jobs:
                 });
 
                 const itemsConnection = result.node.items;
-                const match = itemsConnection.nodes.find(
-                  item => item.content && item.content.number === prNumber
-                );
-
-                if (match) {
-                  itemId = match.id;
-                  break;
+                
+                for (const item of itemsConnection.nodes) {
+                  if (item.content && item.content.__typename === 'Issue') {
+                    if (issueNumbers.includes(item.content.number)) {
+                      itemId = item.id;
+                      foundIssueNumber = item.content.number;
+                      break;
+                    }
+                  }
                 }
 
-                hasNextPage = itemsConnection.pageInfo.hasNextPage;
-                cursor = itemsConnection.pageInfo.endCursor;
+                if (!itemId) {
+                  hasNextPage = itemsConnection.pageInfo.hasNextPage;
+                  cursor = itemsConnection.pageInfo.endCursor;
+                }
               }
 
               if (!itemId) {
-                console.log(`⚠️ PR #${prNumber} is not in the project. Add it manually first.`);
+                console.log(`⚠️ None of the linked issues (${issueNumbers.join(', ')}) are in the project.`);
+                console.log(`👉 Add one of these issues to the "Testing" project board.`);
                 return;
               }
 
-              console.log(`✅ Found project item ID: ${itemId}`);
+              console.log(`✅ Found Issue #${foundIssueNumber} in project. Item ID: ${itemId}`);
 
-              // Update the QA Sign-off text field
+              // Step 3: Update the QA Sign-off field
               const mutation = `
                 mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
                   updateProjectV2ItemFieldValue(input: {
@@ -115,7 +149,7 @@ jobs:
                 value: qaValue
               });
 
-              console.log(`🎉 Successfully updated "QA Sign-off" field to: "${qaValue}"`);
+              console.log(`🎉 Successfully updated Issue #${foundIssueNumber} "QA Sign-off" field to: "${qaValue}"`);
             } catch (error) {
               console.error(`❌ Failed to update QA field: ${error.message}`);
               core.setFailed(error.message);
