@@ -9,11 +9,10 @@ permissions:
   issues: write
   pull-requests: write
   statuses: write
-  projects: write
 
 jobs:
   validate-signoff:
-    name: Validate Sign-off
+    name: Validate Sign-off Checkboxes
     runs-on: ubuntu-latest
     steps:
       - name: Process Sign-offs
@@ -29,7 +28,7 @@ jobs:
             const body = pr.body || "";
             const actor = context.actor;
 
-            console.log(`Processing PR #${prNumber} by @${actor}`);
+            console.log(`Processing PR #${prNumber} edited by @${actor}`);
 
             const roles = ["Code Review", "QA Signoff", "Impact Analysis Review"];
             const signoffMarker = "<!-- PR-SIGNOFF-STATUS -->";
@@ -38,27 +37,28 @@ jobs:
               return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             }
 
-            // 1. Extract sign-off data
+            // 1. Build sign-off data in a SINGLE pass (removed redundant Step 4)
             const signoffData = {};
             for (const role of roles) {
               const regex = new RegExp(`^\\s*-\\s*\\[[xX]\\]\\s*${escapeRegex(role)}\\s*$`, "im");
               if (regex.test(body)) {
                 signoffData[role] = actor;
-                console.log(`✅ ${role}: @${actor}`);
-              } else {
-                console.log(` ${role}: Pending`);
               }
             }
             const checkedCount = Object.keys(signoffData).length;
+            console.log(`Checked: ${checkedCount}/${roles.length}`);
 
-            // 2. Generate status table
-            const tableRows = roles.map(role => {
-              const signer = signoffData[role];
-              return signer 
-                ? `| **${role}** | ✅ Approved | @${signer} |`
-                : `| **${role}** | ⏳ Pending | - |`;
-            }).join("\n");
+            // Helper function to generate table rows (removed duplicate code)
+            const generateTableRows = () => {
+              return roles.map(role => {
+                const signer = signoffData[role];
+                return signer 
+                  ? `| **${role}** | ✅ Approved | @${signer} |`
+                  : `| **${role}** | ⏳ Pending | - |`;
+              }).join("\n");
+            };
 
+            const tableRows = generateTableRows();
             const commentBody = `${signoffMarker}
 
             \`\`\`json
@@ -70,101 +70,90 @@ jobs:
             | Role | Status | Signed By |
             |------|--------|-----------|
             ${tableRows}
-
-            *Last updated: ${new Date().toISOString()}*
             `;
 
-            // 3. Update PR comment
+            // 2. Get ALL existing PR comments
             const { data: comments } = await github.rest.issues.listComments({
               owner, repo, issue_number: prNumber, per_page: 100
             });
 
-            const existingComment = comments.find(c => c.body && c.body.includes(signoffMarker));
+            // 3. Find ALL existing sign-off comments
+            const existingSignoffComments = comments.filter(c => 
+              c.body && c.body.includes(signoffMarker)
+            );
 
-            if (existingComment) {
+            console.log(`Found ${existingSignoffComments.length} existing sign-off comments`);
+
+            // 4. UPDATE the first comment, DELETE the rest (prevents notification spam)
+            if (existingSignoffComments.length > 0) {
               await github.rest.issues.updateComment({
-                owner, repo, comment_id: existingComment.id, body: commentBody
+                owner, repo, comment_id: existingSignoffComments[0].id, body: commentBody
               });
-              console.log(`✅ Updated comment`);
+              console.log(`✅ Updated existing sign-off comment #${existingSignoffComments[0].id}`);
+              
+              for (let i = 1; i < existingSignoffComments.length; i++) {
+                const dup = existingSignoffComments[i];
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: dup.id });
+                console.log(`🗑️ Deleted duplicate comment #${dup.id}`);
+              }
             } else {
               await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber, body: commentBody
               });
-              console.log(`✅ Created comment`);
+              console.log("✅ Created new sign-off comment");
             }
 
-            // 4. Update Project field
-            const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";
-            const SIGNOFF_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";
-
-            try {
-              const projectQuery = `
-                query($projectId: ID!) {
-                  node(id: $projectId) {
-                    ... on ProjectV2 {
-                      items(first: 100) {
-                        nodes {
-                          id
-                          content {
-                            ... on Issue { number }
-                            ... on PullRequest { number }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              `;
-
-              const projectData = await github.graphql(projectQuery, { projectId: PROJECT_ID });
-              const project = projectData.node;
-              
-              // Find PR number and any linked issue numbers
-              const numbersToFind = new Set([prNumber]);
-              const issueRegex = /#(\d+)/g;
-              let match;
-              while ((match = issueRegex.exec(body)) !== null) {
-                numbersToFind.add(parseInt(match[1], 10));
-              }
-
-              const itemsToUpdate = project.items.nodes.filter(item => 
-                numbersToFind.has(item.content?.number)
-              );
-
-              if (itemsToUpdate.length > 0) {
-                const statusText = roles.map(role => {
-                  const signer = signoffData[role];
-                  return signer ? `${role}: @${signer}` : `${role}: Pending`;
-                }).join("\\n");
-
-                for (const item of itemsToUpdate) {
-                  await github.graphql(`
-                    mutation {
-                      updateProjectV2ItemFieldValue(
-                        input: {
-                          projectId: "${PROJECT_ID}"
-                          itemId: "${item.id}"
-                          fieldId: "${SIGNOFF_FIELD_ID}"
-                          value: {
-                            text: "${statusText}"
-                          }
-                        }
-                      ) {
-                        projectV2Item { id }
-                      }
-                    }
-                  `);
-                  console.log(`✅ Updated Project item #${item.content.number}`);
-                }
-              } else {
-                console.log("⚠️ No matching items found in project");
-              }
-            } catch (error) {
-              console.log(`❌ Project update failed: ${error.message}`);
-              throw error; // Re-throw to make workflow fail visibly
+            // 5. Find and Update Linked Issues (optimized with matchAll)
+            const issueNumbers = new Set();
+            
+            // Match standard GitHub closing keywords
+            for (const match of body.matchAll(/(?:Closes|Fixes|Resolves)\s+#(\d+)/gi)) {
+              issueNumbers.add(parseInt(match[1], 10));
+            }
+            
+            // Match any other #123 references (excluding the current PR number)
+            for (const match of body.matchAll(/#(\d+)/g)) {
+              const num = parseInt(match[1], 10);
+              if (num !== prNumber) issueNumbers.add(num);
             }
 
-            // 5. Set commit status
+            for (const issueNumber of issueNumbers) {
+              try {
+                const { data: issue } = await github.rest.issues.get({ 
+                  owner, repo, issue_number: issueNumber 
+                });
+                
+                const issueTableRows = generateTableRows();
+                const issueSignoffTable = `${signoffMarker}
+
+            ## PR Sign-off Status
+
+            | Role | Status | Signed By |
+            |------|--------|-----------|
+            ${issueTableRows}
+            ---
+            *Automatically synchronized from PR #${prNumber} on ${new Date().toISOString()}*`;
+                
+                let newIssueBody = issue.body || "";
+                
+                // Robust string replacement instead of fragile regex
+                if (newIssueBody.includes(signoffMarker)) {
+                  const markerIndex = newIssueBody.indexOf(signoffMarker);
+                  newIssueBody = newIssueBody.substring(0, markerIndex).trim() + "\n\n" + issueSignoffTable;
+                } else {
+                  newIssueBody = `${newIssueBody.trim()}\n\n${issueSignoffTable}`;
+                }
+                
+                await github.rest.issues.update({ 
+                  owner, repo, issue_number: issueNumber, body: newIssueBody 
+                });
+                console.log(`✅ Updated Issue #${issueNumber}`);
+              } catch (error) {
+                console.log(`⚠️ Could not update Issue #${issueNumber}: ${error.message}`);
+              }
+            }
+
+            // 6. Set Commit Status for Branch Protection
             const allSignedOff = roles.every(role => signoffData[role]);
             
             await github.rest.repos.createCommitStatus({
@@ -174,4 +163,4 @@ jobs:
               description: `${checkedCount}/${roles.length} sign-offs complete`
             });
 
-            console.log(allSignedOff ? "✅ ALL SIGN-OFFS COMPLETE" : `⏳ ${checkedCount}/${roles.length} complete`);
+            console.log(allSignedOff ? "✅ ALL SIGN-OFFS COMPLETE" : `⏳ ${checkedCount}/${roles.length} SIGN-OFFS COMPLETE`);
