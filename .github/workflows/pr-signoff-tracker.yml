@@ -37,22 +37,57 @@ jobs:
               return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             }
 
-            // 1. Build sign-off data in a SINGLE pass (removed redundant Step 4)
-            const signoffData = {};
+            // 1. Determine which roles are checked in the CURRENT body.
+            const checkedNow = {};
             for (const role of roles) {
               const regex = new RegExp(`^\\s*-\\s*\\[[xX]\\]\\s*${escapeRegex(role)}\\s*$`, "im");
-              if (regex.test(body)) {
-                signoffData[role] = actor;
+              checkedNow[role] = regex.test(body);
+            }
+
+            // 2. Load the PREVIOUSLY recorded sign-off data from the marker
+            //    comment (if any) so we don't overwrite existing signers.
+            //    Without this, every edit re-stamps ALL currently-checked
+            //    roles with whoever made THIS edit, silently overwriting
+            //    other people's sign-off attribution.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: prNumber, per_page: 100
+            });
+
+            const existingSignoffComments = comments.filter(c => c.body && c.body.includes(signoffMarker));
+            console.log(`Found ${existingSignoffComments.length} existing sign-off comments`);
+
+            let previousData = {};
+            if (existingSignoffComments.length > 0) {
+              const jsonMatch = existingSignoffComments[0].body.match(/```json\s*([\s\S]*?)\s*```/);
+              if (jsonMatch) {
+                try {
+                  previousData = JSON.parse(jsonMatch[1]);
+                } catch (e) {
+                  console.log(`⚠️ Could not parse previous sign-off data: ${e.message}`);
+                }
               }
             }
+
+            // 3. Merge: keep the previously recorded signer for any role that
+            //    was already checked. Only attribute `actor` to roles that
+            //    are newly transitioning from unchecked -> checked in this
+            //    edit. Roles that got unchecked lose their signer.
+            const signoffData = {};
+            for (const role of roles) {
+              if (!checkedNow[role]) {
+                continue; // unchecked now -- no signer, regardless of history
+              }
+              signoffData[role] = previousData[role] || actor;
+            }
+
             const checkedCount = Object.keys(signoffData).length;
             console.log(`Checked: ${checkedCount}/${roles.length}`);
 
-            // Helper function to generate table rows (removed duplicate code)
+            // Helper function to generate table rows
             const generateTableRows = () => {
               return roles.map(role => {
                 const signer = signoffData[role];
-                return signer 
+                return signer
                   ? `| **${role}** | ✅ Approved | @${signer} |`
                   : `| **${role}** | ⏳ Pending | - |`;
               }).join("\n");
@@ -60,29 +95,15 @@ jobs:
 
             const tableRows = generateTableRows();
             const commentBody = `${signoffMarker}
+\`\`\`json
+${JSON.stringify(signoffData, null, 2)}
+\`\`\`
 
-            \`\`\`json
-            ${JSON.stringify(signoffData, null, 2)}
-            \`\`\`
+## PR Sign-off Status
 
-            ## PR Sign-off Status
-
-            | Role | Status | Signed By |
-            |------|--------|-----------|
-            ${tableRows}
-            `;
-
-            // 2. Get ALL existing PR comments
-            const { data: comments } = await github.rest.issues.listComments({
-              owner, repo, issue_number: prNumber, per_page: 100
-            });
-
-            // 3. Find ALL existing sign-off comments
-            const existingSignoffComments = comments.filter(c => 
-              c.body && c.body.includes(signoffMarker)
-            );
-
-            console.log(`Found ${existingSignoffComments.length} existing sign-off comments`);
+| Role | Status | Signed By |
+|------|--------|-----------|
+${tableRows}`;
 
             // 4. UPDATE the first comment, DELETE the rest (prevents notification spam)
             if (existingSignoffComments.length > 0) {
@@ -90,7 +111,7 @@ jobs:
                 owner, repo, comment_id: existingSignoffComments[0].id, body: commentBody
               });
               console.log(`✅ Updated existing sign-off comment #${existingSignoffComments[0].id}`);
-              
+
               for (let i = 1; i < existingSignoffComments.length; i++) {
                 const dup = existingSignoffComments[i];
                 await github.rest.issues.deleteComment({ owner, repo, comment_id: dup.id });
@@ -105,12 +126,12 @@ jobs:
 
             // 5. Find and Update Linked Issues (optimized with matchAll)
             const issueNumbers = new Set();
-            
+
             // Match standard GitHub closing keywords
             for (const match of body.matchAll(/(?:Closes|Fixes|Resolves)\s+#(\d+)/gi)) {
               issueNumbers.add(parseInt(match[1], 10));
             }
-            
+
             // Match any other #123 references (excluding the current PR number)
             for (const match of body.matchAll(/#(\d+)/g)) {
               const num = parseInt(match[1], 10);
@@ -119,23 +140,21 @@ jobs:
 
             for (const issueNumber of issueNumbers) {
               try {
-                const { data: issue } = await github.rest.issues.get({ 
-                  owner, repo, issue_number: issueNumber 
-                });
-                
+                const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
+
                 const issueTableRows = generateTableRows();
                 const issueSignoffTable = `${signoffMarker}
+## PR Sign-off Status
 
-            ## PR Sign-off Status
+| Role | Status | Signed By |
+|------|--------|-----------|
+${issueTableRows}
 
-            | Role | Status | Signed By |
-            |------|--------|-----------|
-            ${issueTableRows}
-            ---
-            *Automatically synchronized from PR #${prNumber} on ${new Date().toISOString()}*`;
-                
+---
+*Automatically synchronized from PR #${prNumber} on ${new Date().toISOString()}*`;
+
                 let newIssueBody = issue.body || "";
-                
+
                 // Robust string replacement instead of fragile regex
                 if (newIssueBody.includes(signoffMarker)) {
                   const markerIndex = newIssueBody.indexOf(signoffMarker);
@@ -143,10 +162,8 @@ jobs:
                 } else {
                   newIssueBody = `${newIssueBody.trim()}\n\n${issueSignoffTable}`;
                 }
-                
-                await github.rest.issues.update({ 
-                  owner, repo, issue_number: issueNumber, body: newIssueBody 
-                });
+
+                await github.rest.issues.update({ owner, repo, issue_number: issueNumber, body: newIssueBody });
                 console.log(`✅ Updated Issue #${issueNumber}`);
               } catch (error) {
                 console.log(`⚠️ Could not update Issue #${issueNumber}: ${error.message}`);
@@ -155,7 +172,6 @@ jobs:
 
             // 6. Set Commit Status for Branch Protection
             const allSignedOff = roles.every(role => signoffData[role]);
-            
             await github.rest.repos.createCommitStatus({
               owner, repo, sha,
               state: allSignedOff ? "success" : "pending",
