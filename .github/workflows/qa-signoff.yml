@@ -29,16 +29,19 @@ jobs:
         uses: actions/github-script@v7
         env:
           # No project/field IDs hardcoded here -- this workflow can be copied
-          # into any repo unchanged. Instead, set these two repository
-          # variables per repo (Settings > Secrets and variables > Actions >
-          # Variables):
-          #   PROJECT_TITLE  -- exact title of the Projects V2 board linked
-          #                      to this repo (e.g. "Testing")
+          # into any repo unchanged. Instead, set these repository variables
+          # per repo (Settings > Secrets and variables > Actions > Variables):
+          #   PROJECT_TITLES -- comma-separated list of Projects V2 board
+          #                     titles linked to this repo, e.g.
+          #                     "Testing,Featureplan,Imapact team"
+          #                     The QA field is updated on every board in
+          #                     this list that the linked issue is (or gets
+          #                     added to).
           #   QA_FIELD_NAME  -- exact name of the custom text field
-          #                      (defaults to "QA Sign-off" if not set)
-          # The project must be linked to the repo (repo's "Projects" tab)
+          #                     (defaults to "QA Sign-off" if not set)
+          # Each project must be linked to the repo (repo's "Projects" tab)
           # for the lookup below to find it.
-          PROJECT_TITLE: ${{ vars.PROJECT_TITLE }}
+          PROJECT_TITLES: ${{ vars.PROJECT_TITLES }}
           QA_FIELD_NAME: ${{ vars.QA_FIELD_NAME }}
         with:
           # Requires a PAT with Projects V2 write access, see note above.
@@ -50,18 +53,20 @@ jobs:
             const actor = context.actor;
             const body = context.payload.pull_request.body || '';
 
-            const projectTitle = process.env.PROJECT_TITLE;
+            const projectTitlesRaw = process.env.PROJECT_TITLES;
             const qaFieldName = process.env.QA_FIELD_NAME || 'QA Sign-off';
 
-            if (!projectTitle) {
-              core.setFailed('Repository variable PROJECT_TITLE is not set. Add it under Settings > Secrets and variables > Actions > Variables.');
+            if (!projectTitlesRaw) {
+              core.setFailed('Repository variable PROJECT_TITLES is not set. Add it under Settings > Secrets and variables > Actions > Variables (comma-separated project titles).');
               return;
             }
 
-            // Resolve the project ID by title and the field ID by name at
-            // runtime, instead of hardcoding IDs. This makes the workflow
+            const projectTitles = projectTitlesRaw.split(',').map(t => t.trim()).filter(Boolean);
+
+            // Resolve each project's ID by title and its QA field ID by name
+            // at runtime, instead of hardcoding IDs. This makes the workflow
             // portable across repos/projects -- copy the file as-is and just
-            // set PROJECT_TITLE (and optionally QA_FIELD_NAME) per repo.
+            // set PROJECT_TITLES (and optionally QA_FIELD_NAME) per repo.
             const projectLookupQuery = `
               query($owner: String!, $repo: String!) {
                 repository(owner: $owner, name: $repo) {
@@ -88,29 +93,38 @@ jobs:
               repo: repo
             });
 
-            const projects = projectLookupResult.repository.projectsV2.nodes;
-            const project = projects.find(p => p.title === projectTitle);
+            const allProjects = projectLookupResult.repository.projectsV2.nodes;
 
-            if (!project) {
-              const available = projects.map(p => p.title).join(', ') || '(none)';
-              core.setFailed(`No project titled "${projectTitle}" is linked to ${owner}/${repo}. Linked projects: ${available}. Link the project via the repo's "Projects" tab.`);
-              return;
+            // Resolve each requested title to { PROJECT_ID, QA_FIELD_ID }.
+            // Titles that don't match, or whose board lacks the QA field,
+            // are logged and skipped rather than failing the whole run --
+            // one misconfigured board shouldn't block updates on the rest.
+            const resolvedProjects = [];
+            for (const title of projectTitles) {
+              const project = allProjects.find(p => p.title === title);
+
+              if (!project) {
+                const available = allProjects.map(p => p.title).join(', ') || '(none)';
+                console.log(`Skipping "${title}": no project with that title is linked to ${owner}/${repo}. Linked projects: ${available}.`);
+                continue;
+              }
+
+              const field = project.fields.nodes.find(f => f && f.name === qaFieldName);
+
+              if (!field) {
+                const available = project.fields.nodes.filter(Boolean).map(f => f.name).join(', ') || '(none)';
+                console.log(`Skipping "${title}": no field named "${qaFieldName}" found. Available fields: ${available}.`);
+                continue;
+              }
+
+              resolvedProjects.push({ title, projectId: project.id, fieldId: field.id });
+              console.log(`Resolved project "${title}" -> ${project.id}, field "${qaFieldName}" -> ${field.id}`);
             }
 
-            const PROJECT_ID = project.id;
-
-            const field = project.fields.nodes.find(f => f && f.name === qaFieldName);
-
-            if (!field) {
-              const available = project.fields.nodes.filter(Boolean).map(f => f.name).join(', ') || '(none)';
-              core.setFailed(`No field named "${qaFieldName}" found on project "${projectTitle}". Available fields: ${available}.`);
+            if (resolvedProjects.length === 0) {
+              core.setFailed(`None of the configured PROJECT_TITLES (${projectTitles.join(', ')}) could be resolved with field "${qaFieldName}". See log above for details.`);
               return;
             }
-
-            const QA_FIELD_ID = field.id;
-
-            console.log(`Resolved project "${projectTitle}" -> ${PROJECT_ID}`);
-            console.log(`Resolved field "${qaFieldName}" -> ${QA_FIELD_ID}`);
 
             // The PR description contains a markdown checklist, e.g.:
             //   - [x] QA Signoff
@@ -160,10 +174,11 @@ jobs:
 
             console.log(`Linked issue(s): ${linkedIssues.map(i => i.number).join(', ')}`);
 
-            // Finds the ProjectV2 item id for a given content number (issue or PR).
-            // Projects V2 has no server-side filter by content number, so we
-            // page through all items and match client-side.
-            async function findProjectItemByNumber(number) {
+            // Finds the ProjectV2 item id for a given content number (issue or PR)
+            // within a specific project. Projects V2 has no server-side filter
+            // by content number, so we page through all items and match
+            // client-side.
+            async function findProjectItemByNumber(projectId, number) {
               const itemQuery = `
                 query($projectId: ID!, $cursor: String) {
                   node(id: $projectId) {
@@ -195,7 +210,7 @@ jobs:
 
               while (hasNextPage) {
                 const result = await github.graphql(itemQuery, {
-                  projectId: PROJECT_ID,
+                  projectId: projectId,
                   cursor: cursor
                 });
 
@@ -215,7 +230,7 @@ jobs:
               return null;
             }
 
-            async function updateQaField(itemId) {
+            async function updateQaField(projectId, fieldId, itemId) {
               const mutation = `
                 mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
                   updateProjectV2ItemFieldValue(input: {
@@ -230,46 +245,48 @@ jobs:
               `;
 
               await github.graphql(mutation, {
-                projectId: PROJECT_ID,
+                projectId: projectId,
                 itemId: itemId,
-                fieldId: QA_FIELD_ID,
+                fieldId: fieldId,
                 value: qaValue
               });
             }
 
             try {
-              for (const issue of linkedIssues) {
-                const issueNumber = issue.number;
-                const issueNodeId = issue.id;
+              for (const { title, projectId, fieldId } of resolvedProjects) {
+                for (const issue of linkedIssues) {
+                  const issueNumber = issue.number;
+                  const issueNodeId = issue.id;
 
-                let itemId = await findProjectItemByNumber(issueNumber);
+                  let itemId = await findProjectItemByNumber(projectId, issueNumber);
 
-                if (!itemId) {
-                  console.log(`Issue #${issueNumber} is not in the project yet. Adding it now.`);
-                  const addMutation = `
-                    mutation($projectId: ID!, $contentId: ID!) {
-                      addProjectV2ItemById(input: {
-                        projectId: $projectId
-                        contentId: $contentId
-                      }) {
-                        item {
-                          id
+                  if (!itemId) {
+                    console.log(`[${title}] Issue #${issueNumber} is not in the project yet. Adding it now.`);
+                    const addMutation = `
+                      mutation($projectId: ID!, $contentId: ID!) {
+                        addProjectV2ItemById(input: {
+                          projectId: $projectId
+                          contentId: $contentId
+                        }) {
+                          item {
+                            id
+                          }
                         }
                       }
-                    }
-                  `;
+                    `;
 
-                  const addResult = await github.graphql(addMutation, {
-                    projectId: PROJECT_ID,
-                    contentId: issueNodeId
-                  });
+                    const addResult = await github.graphql(addMutation, {
+                      projectId: projectId,
+                      contentId: issueNodeId
+                    });
 
-                  itemId = addResult.addProjectV2ItemById.item.id;
-                  console.log(`Added issue #${issueNumber} to the project.`);
+                    itemId = addResult.addProjectV2ItemById.item.id;
+                    console.log(`[${title}] Added issue #${issueNumber} to the project.`);
+                  }
+
+                  await updateQaField(projectId, fieldId, itemId);
+                  console.log(`[${title}] Updated "${qaFieldName}" field on issue #${issueNumber} to: "${qaValue}"`);
                 }
-
-                await updateQaField(itemId);
-                console.log(`Updated "QA Sign-off" field on issue #${issueNumber} to: "${qaValue}"`);
               }
             } catch (error) {
               console.error(`Failed to update QA field: ${error.message}`);
