@@ -27,6 +27,19 @@ jobs:
     steps:
       - name: Update QA Sign-off in Project
         uses: actions/github-script@v7
+        env:
+          # No project/field IDs hardcoded here -- this workflow can be copied
+          # into any repo unchanged. Instead, set these two repository
+          # variables per repo (Settings > Secrets and variables > Actions >
+          # Variables):
+          #   PROJECT_TITLE  -- exact title of the Projects V2 board linked
+          #                      to this repo (e.g. "Testing")
+          #   QA_FIELD_NAME  -- exact name of the custom text field
+          #                      (defaults to "QA Sign-off" if not set)
+          # The project must be linked to the repo (repo's "Projects" tab)
+          # for the lookup below to find it.
+          PROJECT_TITLE: ${{ vars.PROJECT_TITLE }}
+          QA_FIELD_NAME: ${{ vars.QA_FIELD_NAME }}
         with:
           # Requires a PAT with Projects V2 write access, see note above.
           github-token: ${{ secrets.PROJECTS_PAT }}
@@ -37,9 +50,67 @@ jobs:
             const actor = context.actor;
             const body = context.payload.pull_request.body || '';
 
-            // Hardcoded Project and Field IDs from your GraphQL output
-            const PROJECT_ID = "PVT_kwHODDf9DM4BjCjd";
-            const QA_FIELD_ID = "PVTF_lAHODDf9DM4BjCjdzhh4gjY";
+            const projectTitle = process.env.PROJECT_TITLE;
+            const qaFieldName = process.env.QA_FIELD_NAME || 'QA Sign-off';
+
+            if (!projectTitle) {
+              core.setFailed('Repository variable PROJECT_TITLE is not set. Add it under Settings > Secrets and variables > Actions > Variables.');
+              return;
+            }
+
+            // Resolve the project ID by title and the field ID by name at
+            // runtime, instead of hardcoding IDs. This makes the workflow
+            // portable across repos/projects -- copy the file as-is and just
+            // set PROJECT_TITLE (and optionally QA_FIELD_NAME) per repo.
+            const projectLookupQuery = `
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  projectsV2(first: 20) {
+                    nodes {
+                      id
+                      title
+                      fields(first: 50) {
+                        nodes {
+                          ... on ProjectV2FieldCommon {
+                            id
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const projectLookupResult = await github.graphql(projectLookupQuery, {
+              owner: owner,
+              repo: repo
+            });
+
+            const projects = projectLookupResult.repository.projectsV2.nodes;
+            const project = projects.find(p => p.title === projectTitle);
+
+            if (!project) {
+              const available = projects.map(p => p.title).join(', ') || '(none)';
+              core.setFailed(`No project titled "${projectTitle}" is linked to ${owner}/${repo}. Linked projects: ${available}. Link the project via the repo's "Projects" tab.`);
+              return;
+            }
+
+            const PROJECT_ID = project.id;
+
+            const field = project.fields.nodes.find(f => f && f.name === qaFieldName);
+
+            if (!field) {
+              const available = project.fields.nodes.filter(Boolean).map(f => f.name).join(', ') || '(none)';
+              core.setFailed(`No field named "${qaFieldName}" found on project "${projectTitle}". Available fields: ${available}.`);
+              return;
+            }
+
+            const QA_FIELD_ID = field.id;
+
+            console.log(`Resolved project "${projectTitle}" -> ${PROJECT_ID}`);
+            console.log(`Resolved field "${qaFieldName}" -> ${QA_FIELD_ID}`);
 
             // The PR description contains a markdown checklist, e.g.:
             //   - [x] QA Signoff
